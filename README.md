@@ -60,7 +60,7 @@ sudo applock set-secret
 # Add a protected application (use the actual binary!)
 sudo applock add /usr/lib64/firefox/firefox Firefox   # Fedora
 # or on Ubuntu:
-sudo applock add /snap/bin/firefox Firefox # Xubuntu
+sudo applock add /usr/lib/firefox Firefox # Xubuntu
 
 # Verify the list
 sudo applock list
