@@ -45,7 +45,7 @@ sudo pacman -S gcc make openssl zenity
 ### Build and install
 
 ```bash
-git clone https://github.com/your-user/applock.git
+git clone https://github.com/pleomati/applock.git
 cd applock
 make clean && make
 sudo make install
