@@ -60,13 +60,13 @@ sudo applock set-secret
 # Add a protected application (use the actual binary!)
 sudo applock add /usr/lib64/firefox/firefox Firefox   # Fedora
 # or on Ubuntu:
-sudo applock add /usr/lib/firefox Firefox # Xubuntu
+sudo applock add /usr/lib/firefox/firefox Firefox # Xubuntu
 
 # Verify the list
 sudo applock list
 ```
 
-> **Note:** Firefox is a shell script. `readlink /proc/<pid>/exe` returns the actual binary, so you must add a path such as `/usr/lib64/firefox/firefox` (Fedora) or `/snap/bin//firefox` (xubuntu).
+> **Note:** /usr/bin/firefox is a shell script. `readlink /proc/<pid>/exe` returns the actual binary, so you must add a path such as `/usr/lib64/firefox/firefox` (Fedora) or `/usr/lib/firefox/firefox` (xubuntu).
 
 ### Running
 
