@@ -19,6 +19,7 @@
 #include <pwd.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
 
 /* ============================================================================
  * CONSTANTS AND PATHS
@@ -28,10 +29,12 @@
 #define UI_SOCK_PATH  "/run/user/1000/applock-ui.sock"
 #define CONF_PATH     "/etc/applock/config"
 #define SECRET_PATH   "/etc/applock/secret"
+#define MARKER_DIR    "/run/applock"
 #define MAX_APPS      64
 #define MAX_PATH      512
 #define SCAN_INTERVAL 500000   /* 0.5 seconds */
-#define MARKER_TTL    60000    /* 60 seconds */
+#define MARKER_TTL    60000       /* in seconds */
+#define AUTH_TIMEOUT  30        /* in seconds timeout for UI agent */
 
 /* ============================================================================
  * PBKDF2 PARAMETERS
@@ -42,38 +45,23 @@
 #define PBKDF2_KEY_LEN    32
 
 /* ============================================================================
- * GET_PPID CACHE
+ * PPID CACHE
  * ============================================================================ */
 
-/*
- * A simple cache for get_ppid() results, valid only within a single
- * daemon_loop() iteration. This avoids repeatedly opening /proc/<pid>/stat
- * for the same PIDs when many child processes are inspected in one pass.
- *
- * The cache is cleared at the beginning of every iteration.
- */
 #define PPID_CACHE_SIZE 512
 
 typedef struct {
-    pid_t pid;    /* process ID (0 = empty slot) */
-    pid_t ppid;   /* cached parent PID, or -1 if lookup failed */
+    pid_t pid;
+    pid_t ppid;
 } PpidCacheEntry;
 
 static PpidCacheEntry g_ppid_cache[PPID_CACHE_SIZE];
 
-/*
- * Clears the PPID cache. Called at the start of each daemon_loop iteration.
- */
 static void ppid_cache_clear(void) {
     memset(g_ppid_cache, 0, sizeof(g_ppid_cache));
 }
 
-/*
- * Looks up a PID in the cache. Returns 1 and sets *ppid if found.
- * Returns 0 if not cached.
- */
 static int ppid_cache_lookup(pid_t pid, pid_t *ppid) {
-    /* Simple linear probing hash based on PID */
     unsigned int idx = ((unsigned int)pid) % PPID_CACHE_SIZE;
     for (int i = 0; i < PPID_CACHE_SIZE; i++) {
         unsigned int slot = (idx + i) % PPID_CACHE_SIZE;
@@ -81,17 +69,11 @@ static int ppid_cache_lookup(pid_t pid, pid_t *ppid) {
             *ppid = g_ppid_cache[slot].ppid;
             return 1;
         }
-        if (g_ppid_cache[slot].pid == 0) {
-            /* Empty slot — not found */
-            return 0;
-        }
+        if (g_ppid_cache[slot].pid == 0) return 0;
     }
     return 0;
 }
 
-/*
- * Inserts a PID/PPID pair into the cache.
- */
 static void ppid_cache_insert(pid_t pid, pid_t ppid) {
     unsigned int idx = ((unsigned int)pid) % PPID_CACHE_SIZE;
     for (int i = 0; i < PPID_CACHE_SIZE; i++) {
@@ -102,7 +84,48 @@ static void ppid_cache_insert(pid_t pid, pid_t ppid) {
             return;
         }
     }
-    /* Cache full — silently ignore (very unlikely with 512 slots) */
+}
+
+/* ============================================================================
+ * AUTH CACHE (PID -> authorized)
+ * ============================================================================ */
+
+#define AUTH_CACHE_SIZE 1024
+
+typedef struct {
+    pid_t pid;
+    int authorized;
+} AuthCacheEntry;
+
+static AuthCacheEntry g_auth_cache[AUTH_CACHE_SIZE];
+
+static void auth_cache_clear(void) {
+    memset(g_auth_cache, 0, sizeof(g_auth_cache));
+}
+
+static int auth_cache_lookup(pid_t pid, int *authorized) {
+    unsigned int idx = ((unsigned int)pid) % AUTH_CACHE_SIZE;
+    for (int i = 0; i < AUTH_CACHE_SIZE; i++) {
+        unsigned int slot = (idx + i) % AUTH_CACHE_SIZE;
+        if (g_auth_cache[slot].pid == pid) {
+            *authorized = g_auth_cache[slot].authorized;
+            return 1;
+        }
+        if (g_auth_cache[slot].pid == 0) return 0;
+    }
+    return 0;
+}
+
+static void auth_cache_insert(pid_t pid, int authorized) {
+    unsigned int idx = ((unsigned int)pid) % AUTH_CACHE_SIZE;
+    for (int i = 0; i < AUTH_CACHE_SIZE; i++) {
+        unsigned int slot = (idx + i) % AUTH_CACHE_SIZE;
+        if (g_auth_cache[slot].pid == 0 || g_auth_cache[slot].pid == pid) {
+            g_auth_cache[slot].pid = pid;
+            g_auth_cache[slot].authorized = authorized;
+            return;
+        }
+    }
 }
 
 /* ============================================================================
@@ -150,8 +173,8 @@ static int load_config(void) {
             char *pipe = strchr(v, '|');
             if (pipe) {
                 *pipe = 0;
-                strncpy(g_apps[g_app_count].path, v, MAX_PATH - 1);
-                strncpy(g_apps[g_app_count].name, pipe + 1, 127);
+                snprintf(g_apps[g_app_count].path, MAX_PATH, "%s", v);
+                snprintf(g_apps[g_app_count].name, 128, "%s", pipe + 1);
                 g_app_count++;
             }
         }
@@ -213,7 +236,10 @@ static int verify_password(const char *input) {
     char calc_hex[PBKDF2_KEY_LEN * 2 + 1];
     pbkdf2_hex(input, salt, PBKDF2_SALT_LEN, calc_hex);
 
-    int result = (strcmp(calc_hex, stored_hash_hex) == 0);
+    /* Constant-time comparison to prevent timing attacks */
+    int result = (CRYPTO_memcmp(calc_hex, stored_hash_hex,
+                                PBKDF2_KEY_LEN * 2) == 0);
+
     memset(calc_hex, 0, sizeof(calc_hex));
     memset(salt, 0, sizeof(salt));
     return result;
@@ -251,7 +277,7 @@ static int ask_via_ui_agent(const char *name, char *out, size_t len) {
     ssize_t w = write(fd, req, strlen(req));
     if (w < 0) { close(fd); return 0; }
 
-    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = AUTH_TIMEOUT, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     FILE *f = fdopen(fd, "r");
@@ -267,12 +293,16 @@ static int ask_via_ui_agent(const char *name, char *out, size_t len) {
 }
 
 /* ============================================================================
- * MARKER FILES
+ * MARKER FILES (in /run/applock/)
  * ============================================================================ */
 
+static void marker_path(pid_t pid, const char *type, char *out, size_t len) {
+    snprintf(out, len, "%s/.applock_%s_%d", MARKER_DIR, type, pid);
+}
+
 static int already_handled(pid_t pid) {
-    char marker[128];
-    snprintf(marker, sizeof(marker), "/tmp/.applock_ok_%d", pid);
+    char marker[256];
+    marker_path(pid, "ok", marker, sizeof(marker));
 
     struct stat st;
     if (stat(marker, &st) != 0) return 0;
@@ -285,22 +315,41 @@ static int already_handled(pid_t pid) {
 }
 
 static void mark_handled(pid_t pid) {
-    char marker[128];
-    snprintf(marker, sizeof(marker), "/tmp/.applock_ok_%d", pid);
+    char marker[256];
+    marker_path(pid, "ok", marker, sizeof(marker));
     int fd = open(marker, O_CREAT | O_WRONLY, 0600);
     if (fd >= 0) close(fd);
 }
 
+static int is_pending(pid_t pid) {
+    char marker[256];
+    marker_path(pid, "pending", marker, sizeof(marker));
+    return access(marker, F_OK) == 0;
+}
+
+static void mark_pending(pid_t pid) {
+    char marker[256];
+    marker_path(pid, "pending", marker, sizeof(marker));
+    int fd = open(marker, O_CREAT | O_WRONLY, 0600);
+    if (fd >= 0) close(fd);
+}
+
+static void unmark_pending(pid_t pid) {
+    char marker[256];
+    marker_path(pid, "pending", marker, sizeof(marker));
+    unlink(marker);
+}
+
 static void clear_all_markers(void) {
-    DIR *d = opendir("/tmp");
+    DIR *d = opendir(MARKER_DIR);
     if (!d) return;
 
     struct dirent *de;
     int count = 0;
     while ((de = readdir(d))) {
-        if (strncmp(de->d_name, ".applock_ok_", 12) != 0) continue;
+        if (strncmp(de->d_name, ".applock_", 9) != 0) continue;
         char full[256];
-        snprintf(full, sizeof(full), "/tmp/%s", de->d_name);
+        snprintf(full, sizeof(full), "%s/%s", MARKER_DIR, de->d_name);
         if (unlink(full) == 0) count++;
     }
     closedir(d);
@@ -308,30 +357,17 @@ static void clear_all_markers(void) {
 }
 
 /* ============================================================================
- * PROCESS TREE INSPECTION (with PPID cache)
+ * PROCESS TREE INSPECTION (with PPID and AUTH caches)
  * ============================================================================ */
 
-/*
- * Reads the parent PID (PPID) of the given process from /proc/<pid>/stat.
- * Uses the PPID cache to avoid repeated file reads within the same iteration.
- *
- * Returns the PPID, or -1 on error.
- */
 static pid_t get_ppid(pid_t pid) {
-    /* Check the cache first */
     pid_t cached;
-    if (ppid_cache_lookup(pid, &cached)) {
-        return cached;
-    }
+    if (ppid_cache_lookup(pid, &cached)) return cached;
 
-    /* Cache miss — read from /proc/<pid>/stat */
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     FILE *f = fopen(path, "r");
-    if (!f) {
-        ppid_cache_insert(pid, -1);
-        return -1;
-    }
+    if (!f) { ppid_cache_insert(pid, -1); return -1; }
 
     char buf[1024];
     if (!fgets(buf, sizeof(buf), f)) {
@@ -342,10 +378,7 @@ static pid_t get_ppid(pid_t pid) {
     fclose(f);
 
     char *p = strrchr(buf, ')');
-    if (!p) {
-        ppid_cache_insert(pid, -1);
-        return -1;
-    }
+    if (!p) { ppid_cache_insert(pid, -1); return -1; }
     p += 2;
 
     char state;
@@ -359,25 +392,36 @@ static pid_t get_ppid(pid_t pid) {
     return -1;
 }
 
-/*
- * Checks whether the given process or any of its ancestors has a valid
- * marker file (i.e., has already been authenticated).
- *
- * Uses the PPID cache via get_ppid() to avoid repeated file reads.
- *
- * Returns 1 if an ancestor is authorized, 0 otherwise.
- */
 static int is_ancestor_authorized(pid_t pid) {
-    pid_t current = pid;
-    int depth = 0;
+    int cached;
+    if (auth_cache_lookup(pid, &cached)) return cached;
 
-    while (current > 1 && depth < 20) {
-        if (already_handled(current)) return 1;
+    pid_t current = pid;
+    pid_t path[20];
+    int path_len = 0;
+    int result = 0;
+
+    while (current > 1 && path_len < 20) {
+        if (auth_cache_lookup(current, &cached)) {
+            result = cached;
+            break;
+        }
+
+        path[path_len++] = current;
+
+        if (already_handled(current)) {
+            result = 1;
+            break;
+        }
+
         current = get_ppid(current);
         if (current <= 0) break;
-        depth++;
     }
-    return 0;
+
+    for (int i = 0; i < path_len; i++)
+        auth_cache_insert(path[i], result);
+
+    return result;
 }
 
 /* ============================================================================
@@ -415,11 +459,14 @@ static void daemon_loop(void) {
         fprintf(stderr, "[applockd] protected path #%d: '%s' (name: %s)\n",
                 i, g_apps[i].path, g_apps[i].name);
 
+    /* Ensure the marker directory exists */
+    mkdir(MARKER_DIR, 0700);
+
     clear_all_markers();
 
     while (1) {
-        /* Clear the PPID cache at the start of each iteration */
         ppid_cache_clear();
+        auth_cache_clear();
 
         DIR *d = opendir("/proc");
         if (!d) { perror("opendir /proc"); sleep(1); continue; }
@@ -440,24 +487,37 @@ static void daemon_loop(void) {
             int idx = is_protected(exe);
             if (idx < 0) continue;
 
+            /* Skip processes already being authenticated */
+            if (is_pending(pid)) continue;
+
             if (is_ancestor_authorized(pid)) {
                 mark_handled(pid);
                 continue;
             }
 
+            /*
+             * If the process is stopped (e.g., user pressed Ctrl+Z, or
+             * a previous daemon instance left it suspended), resume it
+             * with SIGCONT instead of killing it. This respects the
+             * user's intent while allowing the daemon to re-evaluate
+             * the process in the next iteration.
+             */
             if (is_process_stopped(pid)) {
-                fprintf(stderr, "[applockd] process %d stopped without "
-                        "authorization — killing\n", pid);
-                kill(pid, SIGKILL);
-                mark_handled(pid);
+                fprintf(stderr,
+                        "[applockd] process %d stopped without authorization — resuming\n",
+                        pid);
+                kill(pid, SIGCONT);
                 continue;
             }
 
             fprintf(stderr, "[applockd] detected %s (pid %d)\n",
                     g_apps[idx].name, pid);
 
+            mark_pending(pid);
+
             if (kill(pid, SIGSTOP) < 0) {
                 perror("kill SIGSTOP");
+                unmark_pending(pid);
                 continue;
             }
 
@@ -472,30 +532,36 @@ static void daemon_loop(void) {
             }
             memset(pass, 0, sizeof(pass));
 
+            unmark_pending(pid);
+
             if (ok) {
                 mark_handled(pid);
                 kill(pid, SIGCONT);
+                auth_cache_insert(pid, 1);
             } else {
+                kill(pid, SIGCONT);
+                usleep(100000);
                 kill(pid, SIGKILL);
-                mark_handled(pid);
                 fprintf(stderr, "[applockd] killed %s (pid %d)\n", exe, pid);
             }
         }
         closedir(d);
 
         /* Remove marker files for PIDs that no longer exist */
-        DIR *t = opendir("/tmp");
+        DIR *t = opendir(MARKER_DIR);
         if (t) {
             struct dirent *te;
             while ((te = readdir(t))) {
-                if (strncmp(te->d_name, ".applock_ok_", 12) != 0) continue;
-                pid_t p = atoi(te->d_name + 12);
+                pid_t p = 0;
+                if (sscanf(te->d_name, ".applock_ok_%d", &p) != 1 &&
+                    sscanf(te->d_name, ".applock_pending_%d", &p) != 1)
+                    continue;
                 if (p <= 0) continue;
                 char chk[64];
                 snprintf(chk, sizeof(chk), "/proc/%d", p);
                 if (access(chk, F_OK) != 0) {
                     char full[256];
-                    snprintf(full, sizeof(full), "/tmp/%s", te->d_name);
+                    snprintf(full, sizeof(full), "%s/%s", MARKER_DIR, te->d_name);
                     unlink(full);
                 }
             }
@@ -797,4 +863,3 @@ int main(int argc, char **argv) {
 
     usage();
     return 1;
-}
