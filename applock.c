@@ -26,7 +26,6 @@
  * ============================================================================ */
 
 #define SOCK_PATH     "/var/run/applock.sock"
-#define UI_SOCK_PATH  "/run/user/1000/applock-ui.sock"
 #define CONF_PATH     "/etc/applock/config"
 #define SECRET_PATH   "/etc/applock/secret"
 #define MARKER_DIR    "/run/applock"
@@ -43,6 +42,13 @@
 #define PBKDF2_ITERATIONS 75000
 #define PBKDF2_SALT_LEN   16
 #define PBKDF2_KEY_LEN    32
+
+/* ============================================================================
+ * GLOBAL CONFIGURATION
+ * ============================================================================ */
+
+/* UID of the user running the UI agent. Defaults to 1000. */
+static uid_t g_ui_uid = 1000;
 
 /* ============================================================================
  * PPID CACHE
@@ -141,15 +147,62 @@ static AppEntry g_apps[MAX_APPS];
 static int g_app_count = 0;
 
 /* ============================================================================
+ * PATH RESOLUTION (portable across UIDs)
+ * ============================================================================ */
+
+/*
+ * Returns the path to the UI agent socket.
+ *
+ * Priority:
+ *   1. XDG_RUNTIME_DIR (if set) -> $XDG_RUNTIME_DIR/applock-ui.sock
+ *   2. /run/user/<uid>/applock-ui.sock
+ *
+ * The 'uid' argument is the UID of the user running the UI agent.
+ * When called from the daemon (root), it must be the UID from config,
+ * not getuid() (which would return 0).
+ */
+static void get_ui_socket_path(char *path, size_t size, uid_t uid) {
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (runtime && *runtime) {
+        snprintf(path, size, "%s/applock-ui.sock", runtime);
+        return;
+    }
+    snprintf(path, size, "/run/user/%u/applock-ui.sock", (unsigned)uid);
+}
+
+/*
+ * Returns the path to the D-Bus session bus for the given UID.
+ * Uses XDG_RUNTIME_DIR if available, otherwise /run/user/<uid>/bus.
+ */
+static void get_dbus_address(char *out, size_t size, uid_t uid) {
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (runtime && *runtime) {
+        snprintf(out, size, "unix:path=%s/bus", runtime);
+        return;
+    }
+    snprintf(out, size, "unix:path=/run/user/%u/bus", (unsigned)uid);
+}
+
+/* ============================================================================
  * CONFIGURATION LOADING
  * ============================================================================ */
 
+/*
+ * Loads the configuration file. In addition to 'app' entries, it also
+ * recognizes an optional 'ui_uid' key, which specifies the UID of the
+ * user running the UI agent. Default: 1000.
+ *
+ * Example:
+ *   ui_uid = 1000
+ *   app = /usr/lib64/firefox/firefox|Firefox
+ */
 static int load_config(void) {
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) { perror("[load_config] fopen"); return -1; }
 
     char line[1024];
     g_app_count = 0;
+    g_ui_uid = 1000;  /* default */
 
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n")] = 0;
@@ -169,7 +222,9 @@ static int load_config(void) {
         char *vend = v + strlen(v);
         while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) *--vend = 0;
 
-        if (strcmp(k, "app") == 0 && g_app_count < MAX_APPS) {
+        if (strcmp(k, "ui_uid") == 0) {
+            g_ui_uid = (uid_t)atoi(v);
+        } else if (strcmp(k, "app") == 0 && g_app_count < MAX_APPS) {
             char *pipe = strchr(v, '|');
             if (pipe) {
                 *pipe = 0;
@@ -236,7 +291,6 @@ static int verify_password(const char *input) {
     char calc_hex[PBKDF2_KEY_LEN * 2 + 1];
     pbkdf2_hex(input, salt, PBKDF2_SALT_LEN, calc_hex);
 
-    /* Constant-time comparison to prevent timing attacks */
     int result = (CRYPTO_memcmp(calc_hex, stored_hash_hex,
                                 PBKDF2_KEY_LEN * 2) == 0);
 
@@ -262,11 +316,15 @@ static int read_password(char *buf, size_t len) {
  * ============================================================================ */
 
 static int ask_via_ui_agent(const char *name, char *out, size_t len) {
+    char ui_sock[256];
+    get_ui_socket_path(ui_sock, sizeof(ui_sock), g_ui_uid);
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 0;
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, UI_SOCK_PATH, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ui_sock);
+
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
         return 0;
@@ -452,16 +510,19 @@ static int is_process_stopped(pid_t pid) {
  * ============================================================================ */
 
 static void daemon_loop(void) {
+    char ui_sock_dbg[256];
+    get_ui_socket_path(ui_sock_dbg, sizeof(ui_sock_dbg), g_ui_uid);
+
     fprintf(stderr, "[applockd] monitoring /proc every %d ms, "
             "%d protected applications\n", SCAN_INTERVAL / 1000, g_app_count);
+    fprintf(stderr, "[applockd] UI socket: %s (ui_uid=%u)\n",
+            ui_sock_dbg, (unsigned)g_ui_uid);
 
     for (int i = 0; i < g_app_count; i++)
         fprintf(stderr, "[applockd] protected path #%d: '%s' (name: %s)\n",
                 i, g_apps[i].path, g_apps[i].name);
 
-    /* Ensure the marker directory exists */
     mkdir(MARKER_DIR, 0700);
-
     clear_all_markers();
 
     while (1) {
@@ -487,7 +548,6 @@ static void daemon_loop(void) {
             int idx = is_protected(exe);
             if (idx < 0) continue;
 
-            /* Skip processes already being authenticated */
             if (is_pending(pid)) continue;
 
             if (is_ancestor_authorized(pid)) {
@@ -495,13 +555,6 @@ static void daemon_loop(void) {
                 continue;
             }
 
-            /*
-             * If the process is stopped (e.g., user pressed Ctrl+Z, or
-             * a previous daemon instance left it suspended), resume it
-             * with SIGCONT instead of killing it. This respects the
-             * user's intent while allowing the daemon to re-evaluate
-             * the process in the next iteration.
-             */
             if (is_process_stopped(pid)) {
                 fprintf(stderr,
                         "[applockd] process %d stopped without authorization — resuming\n",
@@ -583,7 +636,7 @@ static void auth_server(void) {
     if (srv < 0) { perror("socket"); exit(1); }
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SOCK_PATH);
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); exit(1);
     }
@@ -651,10 +704,27 @@ static int run_zenity_password(const char *title, char *out, size_t len) {
         const char *disp = getenv("DISPLAY");
         const char *xauth = getenv("XAUTHORITY");
         const char *dbus = getenv("DBUS_SESSION_BUS_ADDRESS");
-        setenv("DISPLAY", disp && *disp ? disp : ":0.0", 1);
-        setenv("XAUTHORITY", xauth && *xauth ? xauth : "/home/ap/.Xauthority", 1);
-        setenv("DBUS_SESSION_BUS_ADDRESS",
-               dbus && *dbus ? dbus : "unix:path=/run/user/1000/bus", 1);
+
+        /* Only override DISPLAY if it's not already set */
+        if (!disp || !*disp) setenv("DISPLAY", ":0.0", 1);
+
+        /* Only override XAUTHORITY if it's not already set */
+        if (!xauth || !*xauth) {
+            const char *home = getenv("HOME");
+            if (home && *home) {
+                char xauth_path[512];
+                snprintf(xauth_path, sizeof(xauth_path), "%s/.Xauthority", home);
+                setenv("XAUTHORITY", xauth_path, 1);
+            }
+        }
+
+        /* Only override DBUS if it's not already set */
+        if (!dbus || !*dbus) {
+            char dbus_addr[256];
+            get_dbus_address(dbus_addr, sizeof(dbus_addr), getuid());
+            setenv("DBUS_SESSION_BUS_ADDRESS", dbus_addr, 1);
+        }
+
         setenv("GTK_USE_PORTAL", "0", 1);
 
         execl("/usr/bin/zenity", "zenity",
@@ -689,12 +759,8 @@ static int run_zenity_password(const char *title, char *out, size_t len) {
 }
 
 static void ui_agent_loop(void) {
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
     char sockpath[256];
-    if (runtime && *runtime)
-        snprintf(sockpath, sizeof(sockpath), "%s/applock-ui.sock", runtime);
-    else
-        snprintf(sockpath, sizeof(sockpath), "%s", UI_SOCK_PATH);
+    get_ui_socket_path(sockpath, sizeof(sockpath), getuid());
 
     unlink(sockpath);
 
@@ -702,7 +768,7 @@ static void ui_agent_loop(void) {
     if (srv < 0) { perror("socket"); exit(1); }
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, sockpath, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sockpath);
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind ui"); exit(1);
     }
@@ -713,6 +779,7 @@ static void ui_agent_loop(void) {
     fprintf(stderr, "[applock-ui] DISPLAY=%s XAUTHORITY=%s\n",
             getenv("DISPLAY") ? getenv("DISPLAY") : "(null)",
             getenv("XAUTHORITY") ? getenv("XAUTHORITY") : "(null)");
+    fprintf(stderr, "[applock-ui] uid=%u\n", (unsigned)getuid());
 
     while (1) {
         int c = accept(srv, NULL, NULL);
@@ -818,6 +885,7 @@ static int cmd_list(void) {
         printf("No protected applications.\n");
         return 0;
     }
+    printf("ui_uid = %u\n", (unsigned)g_ui_uid);
     for (int i = 0; i < g_app_count; i++)
         printf("%s -> %s\n", g_apps[i].name, g_apps[i].path);
     return 0;
@@ -862,4 +930,4 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "ui") == 0)         return cmd_ui();
 
     usage();
-    return 1;
+    return 1
