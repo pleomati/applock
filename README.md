@@ -5,7 +5,7 @@
 - **proc connector** (`cn_proc`) – receives `PROC_EVENT_EXEC` notifications from the kernel, suspends the target process with `SIGSTOP`, prompts for a password, and either resumes (`SIGCONT`) or kills (`SIGKILL`) the process.
 - **fanotify** (`FAN_OPEN_EXEC_PERM`) – intercepts `execve()` **before** the process is created, prompts for a password, and responds with `FAN_ALLOW` or `FAN_DENY`. The process never starts unless authorized.
 
-The daemon is designed for X11 sessions (XFCE, Xubuntu, Fedora XFCE) but should work on any distribution with `systemd`, kernel support for `proc connector` or `fanotify`, and a graphical session.
+The daemon is designed for X11 sessions (XFCE, Xubuntu, Fedora XFCE) but should work on any distribution with `systemd`, kernel support for `proc connector` or `fanotify`, and a graphical session. Tested on Xubuntu 24.04, Fedora XFCE 43. Fedora KDE 45. 
 
 ---
 
@@ -177,7 +177,7 @@ sudo systemctl enable --now applock.service
 sudo systemctl status applock.service
 ```
 
-### UI agent autostart (XFCE)
+### UI agent autostart
 
 Create `~/.config/autostart/applock-ui.desktop`:
 
