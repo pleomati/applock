@@ -346,6 +346,7 @@ Fanotify and proc connector work identically on X11 and Wayland.
 
 Running the UI agent through systemd --user is recommended.
 ---
+---
 
 ## 🗑️ Uninstallation
 
