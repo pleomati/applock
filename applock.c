@@ -21,6 +21,14 @@
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 
+/* Proc connector headers */
+#include <linux/netlink.h>
+#include <linux/connector.h>
+#include <linux/cn_proc.h>
+
+/* Fanotify headers */
+#include <sys/fanotify.h>
+
 /* ============================================================================
  * CONSTANTS AND PATHS
  * ============================================================================ */
@@ -31,9 +39,9 @@
 #define MARKER_DIR    "/run/applock"
 #define MAX_APPS      64
 #define MAX_PATH      512
-#define SCAN_INTERVAL 500000   /* 0.5 seconds */
-#define MARKER_TTL    60000       /* in seconds */
-#define AUTH_TIMEOUT  30        /* in seconds timeout for UI agent */
+#define MARKER_TTL    60000       /* seconds */
+#define AUTH_TIMEOUT  30        /* seconds timeout for UI agent */
+#define NETLINK_RCVBUF (1024 * 1024)  /* 1 MB receive buffer */
 
 /* ============================================================================
  * PBKDF2 PARAMETERS
@@ -44,95 +52,19 @@
 #define PBKDF2_KEY_LEN    32
 
 /* ============================================================================
+ * BACKEND SELECTION
+ * ============================================================================ */
+
+#define BACKEND_PROC      0
+#define BACKEND_FANOTIFY  1
+
+static int g_backend = BACKEND_PROC;
+
+/* ============================================================================
  * GLOBAL CONFIGURATION
  * ============================================================================ */
 
-/* UID of the user running the UI agent. Defaults to 1000. */
 static uid_t g_ui_uid = 1000;
-
-/* ============================================================================
- * PPID CACHE
- * ============================================================================ */
-
-#define PPID_CACHE_SIZE 512
-
-typedef struct {
-    pid_t pid;
-    pid_t ppid;
-} PpidCacheEntry;
-
-static PpidCacheEntry g_ppid_cache[PPID_CACHE_SIZE];
-
-static void ppid_cache_clear(void) {
-    memset(g_ppid_cache, 0, sizeof(g_ppid_cache));
-}
-
-static int ppid_cache_lookup(pid_t pid, pid_t *ppid) {
-    unsigned int idx = ((unsigned int)pid) % PPID_CACHE_SIZE;
-    for (int i = 0; i < PPID_CACHE_SIZE; i++) {
-        unsigned int slot = (idx + i) % PPID_CACHE_SIZE;
-        if (g_ppid_cache[slot].pid == pid) {
-            *ppid = g_ppid_cache[slot].ppid;
-            return 1;
-        }
-        if (g_ppid_cache[slot].pid == 0) return 0;
-    }
-    return 0;
-}
-
-static void ppid_cache_insert(pid_t pid, pid_t ppid) {
-    unsigned int idx = ((unsigned int)pid) % PPID_CACHE_SIZE;
-    for (int i = 0; i < PPID_CACHE_SIZE; i++) {
-        unsigned int slot = (idx + i) % PPID_CACHE_SIZE;
-        if (g_ppid_cache[slot].pid == 0 || g_ppid_cache[slot].pid == pid) {
-            g_ppid_cache[slot].pid = pid;
-            g_ppid_cache[slot].ppid = ppid;
-            return;
-        }
-    }
-}
-
-/* ============================================================================
- * AUTH CACHE (PID -> authorized)
- * ============================================================================ */
-
-#define AUTH_CACHE_SIZE 1024
-
-typedef struct {
-    pid_t pid;
-    int authorized;
-} AuthCacheEntry;
-
-static AuthCacheEntry g_auth_cache[AUTH_CACHE_SIZE];
-
-static void auth_cache_clear(void) {
-    memset(g_auth_cache, 0, sizeof(g_auth_cache));
-}
-
-static int auth_cache_lookup(pid_t pid, int *authorized) {
-    unsigned int idx = ((unsigned int)pid) % AUTH_CACHE_SIZE;
-    for (int i = 0; i < AUTH_CACHE_SIZE; i++) {
-        unsigned int slot = (idx + i) % AUTH_CACHE_SIZE;
-        if (g_auth_cache[slot].pid == pid) {
-            *authorized = g_auth_cache[slot].authorized;
-            return 1;
-        }
-        if (g_auth_cache[slot].pid == 0) return 0;
-    }
-    return 0;
-}
-
-static void auth_cache_insert(pid_t pid, int authorized) {
-    unsigned int idx = ((unsigned int)pid) % AUTH_CACHE_SIZE;
-    for (int i = 0; i < AUTH_CACHE_SIZE; i++) {
-        unsigned int slot = (idx + i) % AUTH_CACHE_SIZE;
-        if (g_auth_cache[slot].pid == 0 || g_auth_cache[slot].pid == pid) {
-            g_auth_cache[slot].pid = pid;
-            g_auth_cache[slot].authorized = authorized;
-            return;
-        }
-    }
-}
 
 /* ============================================================================
  * DATA STRUCTURES
@@ -147,20 +79,9 @@ static AppEntry g_apps[MAX_APPS];
 static int g_app_count = 0;
 
 /* ============================================================================
- * PATH RESOLUTION (portable across UIDs)
+ * PATH RESOLUTION
  * ============================================================================ */
 
-/*
- * Returns the path to the UI agent socket.
- *
- * Priority:
- *   1. XDG_RUNTIME_DIR (if set) -> $XDG_RUNTIME_DIR/applock-ui.sock
- *   2. /run/user/<uid>/applock-ui.sock
- *
- * The 'uid' argument is the UID of the user running the UI agent.
- * When called from the daemon (root), it must be the UID from config,
- * not getuid() (which would return 0).
- */
 static void get_ui_socket_path(char *path, size_t size, uid_t uid) {
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && *runtime) {
@@ -170,10 +91,6 @@ static void get_ui_socket_path(char *path, size_t size, uid_t uid) {
     snprintf(path, size, "/run/user/%u/applock-ui.sock", (unsigned)uid);
 }
 
-/*
- * Returns the path to the D-Bus session bus for the given UID.
- * Uses XDG_RUNTIME_DIR if available, otherwise /run/user/<uid>/bus.
- */
 static void get_dbus_address(char *out, size_t size, uid_t uid) {
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && *runtime) {
@@ -187,22 +104,14 @@ static void get_dbus_address(char *out, size_t size, uid_t uid) {
  * CONFIGURATION LOADING
  * ============================================================================ */
 
-/*
- * Loads the configuration file. In addition to 'app' entries, it also
- * recognizes an optional 'ui_uid' key, which specifies the UID of the
- * user running the UI agent. Default: 1000.
- *
- * Example:
- *   ui_uid = 1000
- *   app = /usr/lib64/firefox/firefox|Firefox
- */
 static int load_config(void) {
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) { perror("[load_config] fopen"); return -1; }
 
     char line[1024];
     g_app_count = 0;
-    g_ui_uid = 1000;  /* default */
+    g_ui_uid = 1000;
+    g_backend = BACKEND_PROC;
 
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n")] = 0;
@@ -222,8 +131,28 @@ static int load_config(void) {
         char *vend = v + strlen(v);
         while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) *--vend = 0;
 
-        if (strcmp(k, "ui_uid") == 0) {
-            g_ui_uid = (uid_t)atoi(v);
+        if (strcmp(k, "backend") == 0) {
+            if (strcmp(v, "fanotify") == 0) {
+                g_backend = BACKEND_FANOTIFY;
+            } else if (strcmp(v, "proc") == 0) {
+                g_backend = BACKEND_PROC;
+            } else {
+                fprintf(stderr,
+                        "[load_config] unknown backend '%s', using 'proc'\n", v);
+                g_backend = BACKEND_PROC;
+            }
+        } else if (strcmp(k, "ui_uid") == 0) {
+            char *endptr = NULL;
+            errno = 0;
+            unsigned long val = strtoul(v, &endptr, 10);
+
+            if (errno != 0 || endptr == v || *endptr != '\0' || val > 65535) {
+                fprintf(stderr,
+                        "[load_config] invalid ui_uid '%s', using default 1000\n", v);
+                g_ui_uid = 1000;
+            } else {
+                g_ui_uid = (uid_t)val;
+            }
         } else if (strcmp(k, "app") == 0 && g_app_count < MAX_APPS) {
             char *pipe = strchr(v, '|');
             if (pipe) {
@@ -351,7 +280,34 @@ static int ask_via_ui_agent(const char *name, char *out, size_t len) {
 }
 
 /* ============================================================================
- * MARKER FILES (in /run/applock/)
+ * UNIFIED AUTHORIZATION
+ * ============================================================================ */
+
+/*
+ * Prompts the user for a password and verifies it.
+ * Returns 1 if the password is correct, 0 otherwise.
+ *
+ * This function is used by BOTH backends (proc connector and fanotify),
+ * keeping the authentication logic in one place.
+ */
+static int authorize_application(const char *path, const char *name) {
+    char pass[256] = {0};
+    int ok = ask_via_ui_agent(name, pass, sizeof(pass)) &&
+             verify_password(pass);
+
+    /* Clear the password from memory regardless of the result */
+    explicit_bzero(pass, sizeof(pass));
+
+    if (ok)
+        fprintf(stderr, "[applockd] authorization OK (%s)\n", path);
+    else
+        fprintf(stderr, "[applockd] authorization DENIED (%s)\n", path);
+
+    return ok;
+}
+
+/* ============================================================================
+ * MARKER FILES
  * ============================================================================ */
 
 static void marker_path(pid_t pid, const char *type, char *out, size_t len) {
@@ -415,76 +371,41 @@ static void clear_all_markers(void) {
 }
 
 /* ============================================================================
- * PROCESS TREE INSPECTION (with PPID and AUTH caches)
+ * PROCESS TREE INSPECTION (used by proc connector backend)
  * ============================================================================ */
 
 static pid_t get_ppid(pid_t pid) {
-    pid_t cached;
-    if (ppid_cache_lookup(pid, &cached)) return cached;
-
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     FILE *f = fopen(path, "r");
-    if (!f) { ppid_cache_insert(pid, -1); return -1; }
+    if (!f) return -1;
 
     char buf[1024];
-    if (!fgets(buf, sizeof(buf), f)) {
-        fclose(f);
-        ppid_cache_insert(pid, -1);
-        return -1;
-    }
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1; }
     fclose(f);
 
     char *p = strrchr(buf, ')');
-    if (!p) { ppid_cache_insert(pid, -1); return -1; }
+    if (!p) return -1;
     p += 2;
 
     char state;
     pid_t ppid;
-    if (sscanf(p, "%c %d", &state, &ppid) == 2) {
-        ppid_cache_insert(pid, ppid);
-        return ppid;
-    }
-
-    ppid_cache_insert(pid, -1);
+    if (sscanf(p, "%c %d", &state, &ppid) == 2) return ppid;
     return -1;
 }
 
 static int is_ancestor_authorized(pid_t pid) {
-    int cached;
-    if (auth_cache_lookup(pid, &cached)) return cached;
-
     pid_t current = pid;
-    pid_t path[20];
-    int path_len = 0;
-    int result = 0;
+    int depth = 0;
 
-    while (current > 1 && path_len < 20) {
-        if (auth_cache_lookup(current, &cached)) {
-            result = cached;
-            break;
-        }
-
-        path[path_len++] = current;
-
-        if (already_handled(current)) {
-            result = 1;
-            break;
-        }
-
+    while (current > 1 && depth < 20) {
+        if (already_handled(current)) return 1;
         current = get_ppid(current);
         if (current <= 0) break;
+        depth++;
     }
-
-    for (int i = 0; i < path_len; i++)
-        auth_cache_insert(path[i], result);
-
-    return result;
+    return 0;
 }
-
-/* ============================================================================
- * PROCESS STATE INSPECTION
- * ============================================================================ */
 
 static int is_process_stopped(pid_t pid) {
     char path[64];
@@ -506,124 +427,276 @@ static int is_process_stopped(pid_t pid) {
 }
 
 /* ============================================================================
- * MAIN DAEMON LOOP
+ * BACKEND: PROC CONNECTOR
  * ============================================================================ */
 
-static void daemon_loop(void) {
-    char ui_sock_dbg[256];
-    get_ui_socket_path(ui_sock_dbg, sizeof(ui_sock_dbg), g_ui_uid);
+static int cn_proc_open(void) {
+    int fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
+    if (fd < 0) {
+        perror("[cn_proc] socket");
+        return -1;
+    }
 
-    fprintf(stderr, "[applockd] monitoring /proc every %d ms, "
-            "%d protected applications\n", SCAN_INTERVAL / 1000, g_app_count);
-    fprintf(stderr, "[applockd] UI socket: %s (ui_uid=%u)\n",
-            ui_sock_dbg, (unsigned)g_ui_uid);
+    int rcvbuf = NETLINK_RCVBUF;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        perror("[cn_proc] setsockopt SO_RCVBUF");
+    }
 
-    for (int i = 0; i < g_app_count; i++)
-        fprintf(stderr, "[applockd] protected path #%d: '%s' (name: %s)\n",
-                i, g_apps[i].path, g_apps[i].name);
+    struct sockaddr_nl addr = {
+        .nl_family = AF_NETLINK,
+        .nl_groups = CN_IDX_PROC,
+        .nl_pid = getpid()
+    };
 
-    mkdir(MARKER_DIR, 0700);
-    clear_all_markers();
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[cn_proc] bind");
+        close(fd);
+        return -1;
+    }
 
-    while (1) {
-        ppid_cache_clear();
-        auth_cache_clear();
+    char buf[NLMSG_SPACE(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))];
+    memset(buf, 0, sizeof(buf));
 
-        DIR *d = opendir("/proc");
-        if (!d) { perror("opendir /proc"); sleep(1); continue; }
+    struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+    nh->nlmsg_len = NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op));
+    nh->nlmsg_type = NLMSG_DONE;
+    nh->nlmsg_flags = 0;
+    nh->nlmsg_seq = 0;
+    nh->nlmsg_pid = getpid();
 
-        struct dirent *de;
-        while ((de = readdir(d))) {
-            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-            pid_t pid = atoi(de->d_name);
-            if (pid <= 1) continue;
+    struct cn_msg *cm = (struct cn_msg *)NLMSG_DATA(nh);
+    cm->id.idx = CN_IDX_PROC;
+    cm->id.val = CN_VAL_PROC;
+    cm->seq = 0;
+    cm->ack = 0;
+    cm->len = sizeof(enum proc_cn_mcast_op);
 
-            char exe[MAX_PATH];
-            char link[64];
-            snprintf(link, sizeof(link), "/proc/%d/exe", pid);
-            ssize_t n = readlink(link, exe, sizeof(exe) - 1);
-            if (n <= 0) continue;
-            exe[n] = 0;
+    enum proc_cn_mcast_op *op = (enum proc_cn_mcast_op *)cm->data;
+    *op = PROC_CN_MCAST_LISTEN;
 
-            int idx = is_protected(exe);
-            if (idx < 0) continue;
+    if (send(fd, nh, nh->nlmsg_len, 0) < 0) {
+        perror("[cn_proc] send PROC_CN_MCAST_LISTEN");
+        close(fd);
+        return -1;
+    }
 
-            if (is_pending(pid)) continue;
+    fprintf(stderr, "[applockd] proc connector enabled (rcvbuf=%d)\n", rcvbuf);
+    return fd;
+}
 
-            if (is_ancestor_authorized(pid)) {
-                mark_handled(pid);
-                continue;
-            }
+static void cn_proc_handle_exec(pid_t pid) {
+    char exe[MAX_PATH];
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/%d/exe", pid);
+    ssize_t n = readlink(link, exe, sizeof(exe) - 1);
+    if (n <= 0) return;
+    exe[n] = 0;
 
-            if (is_process_stopped(pid)) {
-                fprintf(stderr,
-                        "[applockd] process %d stopped without authorization — resuming\n",
-                        pid);
-                kill(pid, SIGCONT);
-                continue;
-            }
+    int idx = is_protected(exe);
+    if (idx < 0) return;
 
-            fprintf(stderr, "[applockd] detected %s (pid %d)\n",
-                    g_apps[idx].name, pid);
+    if (is_pending(pid)) return;
 
-            mark_pending(pid);
+    if (is_ancestor_authorized(pid)) {
+        mark_handled(pid);
+        return;
+    }
 
-            if (kill(pid, SIGSTOP) < 0) {
-                perror("kill SIGSTOP");
-                unmark_pending(pid);
-                continue;
-            }
+    if (is_process_stopped(pid)) {
+        fprintf(stderr,
+                "[applockd] process %d stopped without authorization — resuming\n",
+                pid);
+        kill(pid, SIGCONT);
+        return;
+    }
 
-            char pass[256] = {0};
-            int ok = 0;
-            if (ask_via_ui_agent(g_apps[idx].name, pass, sizeof(pass)) &&
-                verify_password(pass)) {
-                ok = 1;
-                fprintf(stderr, "[applockd] authorization OK\n");
-            } else {
-                fprintf(stderr, "[applockd] authorization DENIED\n");
-            }
-            memset(pass, 0, sizeof(pass));
+    fprintf(stderr, "[applockd] detected %s (pid %d)\n",
+            g_apps[idx].name, pid);
 
-            unmark_pending(pid);
+    mark_pending(pid);
 
-            if (ok) {
-                mark_handled(pid);
-                kill(pid, SIGCONT);
-                auth_cache_insert(pid, 1);
-            } else {
-                kill(pid, SIGCONT);
-                usleep(100000);
-                kill(pid, SIGKILL);
-                fprintf(stderr, "[applockd] killed %s (pid %d)\n", exe, pid);
-            }
-        }
-        closedir(d);
+    if (kill(pid, SIGSTOP) < 0) {
+        perror("kill SIGSTOP");
+        unmark_pending(pid);
+        return;
+    }
 
-        /* Remove marker files for PIDs that no longer exist */
-        DIR *t = opendir(MARKER_DIR);
-        if (t) {
-            struct dirent *te;
-            while ((te = readdir(t))) {
-                pid_t p = 0;
-                if (sscanf(te->d_name, ".applock_ok_%d", &p) != 1 &&
-                    sscanf(te->d_name, ".applock_pending_%d", &p) != 1)
-                    continue;
-                if (p <= 0) continue;
-                char chk[64];
-                snprintf(chk, sizeof(chk), "/proc/%d", p);
-                if (access(chk, F_OK) != 0) {
-                    char full[256];
-                    snprintf(full, sizeof(full), "%s/%s", MARKER_DIR, te->d_name);
-                    unlink(full);
-                }
-            }
-            closedir(t);
-        }
+    int ok = authorize_application(exe, g_apps[idx].name);
 
-        usleep(SCAN_INTERVAL);
+    unmark_pending(pid);
+
+    if (ok) {
+        mark_handled(pid);
+        kill(pid, SIGCONT);
+    } else {
+        kill(pid, SIGCONT);
+        usleep(100000);
+        kill(pid, SIGKILL);
+        fprintf(stderr, "[applockd] killed %s (pid %d)\n", exe, pid);
     }
 }
+
+static void proc_backend_run(void) {
+    int fd = cn_proc_open();
+    if (fd < 0) {
+        fprintf(stderr, "[applockd] failed to initialize proc connector\n");
+        exit(1);
+    }
+
+    char buf[4096];
+    unsigned long enobufs_count = 0;
+
+    while (1) {
+        ssize_t len = recv(fd, buf, sizeof(buf), 0);
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ENOBUFS) {
+                enobufs_count++;
+                if (enobufs_count <= 5 || enobufs_count % 100 == 0) {
+                    fprintf(stderr,
+                            "[cn_proc] ENOBUFS (%lu occurrences) — some events lost, continuing\n",
+                            enobufs_count);
+                }
+                continue;
+            }
+            perror("[cn_proc] recv");
+            break;
+        }
+        if (len == 0) continue;
+
+        struct nlmsghdr *nh;
+        for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, len);
+             nh = NLMSG_NEXT(nh, len)) {
+
+            if (nh->nlmsg_type != NLMSG_DONE) continue;
+
+            struct cn_msg *cm = (struct cn_msg *)NLMSG_DATA(nh);
+            if (cm->id.idx != CN_IDX_PROC || cm->id.val != CN_VAL_PROC) continue;
+
+            struct proc_event *ev = (struct proc_event *)cm->data;
+
+            if (ev->what == PROC_EVENT_EXEC) {
+                pid_t pid = ev->event_data.exec.process_pid;
+                cn_proc_handle_exec(pid);
+            }
+        }
+    }
+
+    close(fd);
+}
+
+/*
+ * Fanotify backend.
+ *
+ * Key design decisions:
+ *   - Uses FAN_CLASS_CONTENT + O_RDONLY (NOT O_RDWR, which causes ETXTBSY).
+ *   - Marks ONLY the protected binaries (NOT the whole filesystem), which
+ *     eliminates the risk of deadlock when Zenity loads shared libraries.
+ *   - Uses authorize_application() for authentication.
+ *   - Uses authorization inheritance: if an ancestor of the process has
+ *     already been authorized (has a valid "ok" marker), the process is
+ *     allowed without prompting.
+ *   - Sends FAN_ALLOW / FAN_DENY to the kernel; the process is not started
+ *     until the daemon responds.
+ */
+static void fan_backend_run(void) {
+    int fanfd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT, O_RDONLY);
+    if (fanfd < 0) {
+        perror("[fan] fanotify_init");
+        fprintf(stderr, "[applockd] fanotify requires CAP_SYS_ADMIN\n");
+        exit(1);
+    }
+
+    /* Mark ONLY the protected binaries — NOT the whole filesystem. */
+    for (int i = 0; i < g_app_count; i++) {
+        if (fanotify_mark(fanfd, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM,
+                          AT_FDCWD, g_apps[i].path) < 0) {
+            fprintf(stderr, "[fan] fanotify_mark(%s): %s\n",
+                    g_apps[i].path, strerror(errno));
+        } else {
+            fprintf(stderr, "[fan] monitoring: %s (name: %s)\n",
+                    g_apps[i].path, g_apps[i].name);
+        }
+    }
+
+    fprintf(stderr, "[applockd] fanotify backend active, %d markers\n",
+            g_app_count);
+
+    char buf[4096];
+    while (1) {
+        ssize_t len = read(fanfd, buf, sizeof(buf));
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            perror("[fan] read");
+            break;
+        }
+
+        struct fanotify_event_metadata *meta = (void *)buf;
+        while (FAN_EVENT_OK(meta, len)) {
+            if (meta->fd >= 0) {
+                char exe[MAX_PATH];
+                char procfd[64];
+                snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", meta->fd);
+                ssize_t n = readlink(procfd, exe, sizeof(exe) - 1);
+
+                struct fanotify_response resp;
+                resp.fd = meta->fd;
+
+                if (n > 0) {
+                    exe[n] = 0;
+                    int idx = is_protected(exe);
+
+                    if (idx < 0) {
+                        /* Not protected — allow without prompting */
+                        resp.response = FAN_ALLOW;
+                    } else {
+                        pid_t pid = meta->pid;
+
+                        /*
+                         * Authorization inheritance: if the process or any
+                         * of its ancestors has already been authorized
+                         * (has a valid "ok" marker), allow without prompting.
+                         *
+                         * This handles the case where Firefox spawns a child
+                         * process (e.g. content process) after the main
+                         * process has been authenticated.
+                         */
+                        if (is_ancestor_authorized(pid)) {
+                            fprintf(stderr,
+                                    "[applockd] %s (pid %d) — ancestor already authorized, allowing\n",
+                                    g_apps[idx].name, pid);
+                            mark_handled(pid);
+                            resp.response = FAN_ALLOW;
+                        } else {
+                            fprintf(stderr,
+                                    "[applockd] detected %s (pid %d)\n",
+                                    g_apps[idx].name, pid);
+
+                            int ok = authorize_application(exe, g_apps[idx].name);
+                            if (ok) {
+                                mark_handled(pid);
+                                resp.response = FAN_ALLOW;
+                            } else {
+                                resp.response = FAN_DENY;
+                            }
+                        }
+                    }
+                } else {
+                    /* Cannot resolve path — deny by default */
+                    resp.response = FAN_DENY;
+                }
+
+                if (write(fanfd, &resp, sizeof(resp)) < 0)
+                    perror("[fan] write response");
+
+                close(meta->fd);
+            }
+            meta = FAN_EVENT_NEXT(meta, len);
+        }
+    }
+
+    close(fanfd);
+} 
 
 /* ============================================================================
  * AUTHENTICATION SERVER
@@ -705,10 +778,8 @@ static int run_zenity_password(const char *title, char *out, size_t len) {
         const char *xauth = getenv("XAUTHORITY");
         const char *dbus = getenv("DBUS_SESSION_BUS_ADDRESS");
 
-        /* Only override DISPLAY if it's not already set */
         if (!disp || !*disp) setenv("DISPLAY", ":0.0", 1);
 
-        /* Only override XAUTHORITY if it's not already set */
         if (!xauth || !*xauth) {
             const char *home = getenv("HOME");
             if (home && *home) {
@@ -718,7 +789,6 @@ static int run_zenity_password(const char *title, char *out, size_t len) {
             }
         }
 
-        /* Only override DBUS if it's not already set */
         if (!dbus || !*dbus) {
             char dbus_addr[256];
             get_dbus_address(dbus_addr, sizeof(dbus_addr), getuid());
@@ -885,6 +955,8 @@ static int cmd_list(void) {
         printf("No protected applications.\n");
         return 0;
     }
+    printf("backend = %s\n",
+           g_backend == BACKEND_FANOTIFY ? "fanotify" : "proc");
     printf("ui_uid = %u\n", (unsigned)g_ui_uid);
     for (int i = 0; i < g_app_count; i++)
         printf("%s -> %s\n", g_apps[i].name, g_apps[i].path);
@@ -902,7 +974,22 @@ static int cmd_run(void) {
         _exit(0);
     }
 
-    daemon_loop();
+    mkdir(MARKER_DIR, 0700);
+    clear_all_markers();
+
+    fprintf(stderr, "[applockd] backend: %s\n",
+            g_backend == BACKEND_FANOTIFY ? "fanotify" : "proc connector");
+    fprintf(stderr, "[applockd] %d protected applications\n", g_app_count);
+    for (int i = 0; i < g_app_count; i++)
+        fprintf(stderr, "[applockd] protected path #%d: '%s' (name: %s)\n",
+                i, g_apps[i].path, g_apps[i].name);
+
+    if (g_backend == BACKEND_FANOTIFY) {
+        fan_backend_run();
+    } else {
+        proc_backend_run();
+    }
+
     return 0;
 }
 
@@ -915,8 +1002,8 @@ static void usage(void) {
     printf("Usage: applock <command>\n"
            "  set-secret            set the authentication password\n"
            "  add <path> <name>     add an application to protect\n"
-           "  list                  list protected applications\n"
-           "  run                   start the daemon (/proc monitor, as root)\n"
+           "  list                  list protected applications and backend\n"
+           "  run                   start the daemon (as root)\n"
            "  ui                    start the UI agent (Zenity, as user)\n");
 }
 
@@ -930,4 +1017,4 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "ui") == 0)         return cmd_ui();
 
     usage();
-    return 1
+    
