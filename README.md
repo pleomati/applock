@@ -345,7 +345,7 @@ The only X11-specific component is the current Zenity-based UI agent.
 Fanotify and proc connector work identically on X11 and Wayland.
 
 Running the UI agent through systemd --user is recommended.
----
+
 ---
 
 ## 🗑️ Uninstallation
