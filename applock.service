@@ -6,13 +6,13 @@ Requires=local-fs.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/applock run
-Restart=on-failure
+Restart=always
 RestartSec=2
 ProtectProc=default
 ProcSubset=all
 
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
