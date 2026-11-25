@@ -335,7 +335,14 @@ The daemon handles `SIGTERM`/`SIGINT` and logs `[applockd] shutting down`. If th
 ```bash
 sudo journalctl -u applock.service -n 20 --no-pager
 ```
+### Wayland
+AppLock itself is display-server agnostic.
 
+The only X11-specific component is the current Zenity-based UI agent.
+
+Fanotify and proc connector work identically on X11 and Wayland.
+
+Running the UI agent through systemd --user is recommended.
 ---
 
 ## 🗑️ Uninstallation
