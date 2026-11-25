@@ -334,6 +334,8 @@ The daemon handles `SIGTERM`/`SIGINT` and logs `[applockd] shutting down`. If th
 
 ```bash
 sudo journalctl -u applock.service -n 20 --no-pager
+```
+---
 
 ### Wayland
 AppLock itself is display-server agnostic.
