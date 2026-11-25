@@ -149,8 +149,6 @@ The daemon will use `/run/user/1001/applock-ui.sock` and `/run/user/1001/bus`. I
 
 Create `/etc/systemd/system/applock.service`:
 
-### For `backend = proc`
-
 ```ini
 [Unit]
 Description=AppLock daemon
