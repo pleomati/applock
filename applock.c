@@ -1017,4 +1017,5 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "ui") == 0)         return cmd_ui();
 
     usage();
-    
+    return 1;
+}
