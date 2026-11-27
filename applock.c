@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <dirent.h>
 #include <time.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -20,6 +21,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
+#include <mntent.h>
 
 /* Proc connector headers */
 #include <linux/netlink.h>
@@ -33,30 +35,40 @@
  * CONSTANTS AND PATHS
  * ============================================================================ */
 
-#define SOCK_PATH     "/var/run/applock.sock"
-#define CONF_PATH     "/etc/applock/config"
-#define SECRET_PATH   "/etc/applock/secret"
-#define MARKER_DIR    "/run/applock"
-#define MAX_APPS      64
-#define MAX_PATH      512
-#define MARKER_TTL    60000       /* seconds */
-#define AUTH_TIMEOUT  30        /* seconds timeout for UI agent */
-#define NETLINK_RCVBUF (1024 * 1024)  /* 1 MB receive buffer */
+#define SOCK_PATH       "/var/run/applock.sock"
+#define CONF_PATH       "/etc/applock/config"
+#define SECRET_PATH     "/etc/applock/secret"
+#define MARKER_DIR      "/run/applock"
+#define MAX_APPS        64
+#define MAX_DIRS        64
+#define MAX_PATH        512
+#define AUTH_TIMEOUT    30              /* seconds timeout for UI agent */
+#define NETLINK_RCVBUF  (1024 * 1024)   /* 1 MB receive buffer */
+
+/*
+ * Marker TTL in SECONDS.
+ *
+ * NOTE: markers outliving their process are a PID-recycling hazard: a new
+ * process reusing a PID of a previously authorized one would inherit the
+ * "ok" marker. Keep this modest; the previous value (60000 s ~ 16.7 h)
+ * was almost certainly a typo for milliseconds.
+ */
+#define MARKER_TTL      3600            /* seconds */
 
 /* ============================================================================
  * PBKDF2 PARAMETERS
  * ============================================================================ */
 
-#define PBKDF2_ITERATIONS 75000
-#define PBKDF2_SALT_LEN   16
-#define PBKDF2_KEY_LEN    32
+#define PBKDF2_ITERATIONS  75000
+#define PBKDF2_SALT_LEN    16
+#define PBKDF2_KEY_LEN     32
 
 /* ============================================================================
  * BACKEND SELECTION
  * ============================================================================ */
 
-#define BACKEND_PROC      0
-#define BACKEND_FANOTIFY  1
+#define BACKEND_PROC       0
+#define BACKEND_FANOTIFY   1
 
 static int g_backend = BACKEND_PROC;
 
@@ -66,23 +78,32 @@ static int g_backend = BACKEND_PROC;
 
 static uid_t g_ui_uid = 1000;
 
+/* FAN_MARK_FILESYSTEM on "/": full execve coverage, higher overhead */
+static int g_mark_filesystem = 0;
+
 /* ============================================================================
  * DATA STRUCTURES
  * ============================================================================ */
 
 typedef struct {
-    char path[MAX_PATH];
-    char name[128];
+    char  path[MAX_PATH];
+    char  name[128];
+    char  hash[65];     /* sha256 hex (lowercase); empty = path fallback */
+    off_t size;         /* reference size from stat at load; <=0 = unknown */
 } AppEntry;
 
 static AppEntry g_apps[MAX_APPS];
-static int g_app_count = 0;
+static int      g_app_count = 0;
+
+static char g_watchdirs[MAX_DIRS][MAX_PATH];
+static int  g_watchdir_count = 0;
 
 /* ============================================================================
  * PATH RESOLUTION
  * ============================================================================ */
 
-static void get_ui_socket_path(char *path, size_t size, uid_t uid) {
+static void get_ui_socket_path(char *path, size_t size, uid_t uid)
+{
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && *runtime) {
         snprintf(path, size, "%s/applock-ui.sock", runtime);
@@ -91,7 +112,8 @@ static void get_ui_socket_path(char *path, size_t size, uid_t uid) {
     snprintf(path, size, "/run/user/%u/applock-ui.sock", (unsigned)uid);
 }
 
-static void get_dbus_address(char *out, size_t size, uid_t uid) {
+static void get_dbus_address(char *out, size_t size, uid_t uid)
+{
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     if (runtime && *runtime) {
         snprintf(out, size, "unix:path=%s/bus", runtime);
@@ -101,35 +123,144 @@ static void get_dbus_address(char *out, size_t size, uid_t uid) {
 }
 
 /* ============================================================================
+ * SHA-256 IDENTIFICATION
+ * ============================================================================ */
+
+/*
+ * Hash the content of an open file descriptor. Used both for computing
+ * reference hashes (cmd_add_app) and for identifying a candidate at exec
+ * time. In the fanotify backend the fd comes straight from the event, so
+ * there is no TOCTOU: nobody can swap the file between open and hashing.
+ */
+static int sha256_fd(int fd, char out_hex[65])
+{
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        return 0;
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx)
+        return 0;
+
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int  mdlen = 0;
+    char          buf[65536];
+    ssize_t       n;
+    int           ok = 1;
+
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1)
+        ok = 0;
+
+    while (ok && (n = read(fd, buf, sizeof(buf))) > 0) {
+        if (EVP_DigestUpdate(ctx, buf, (size_t)n) != 1) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ok && n < 0)
+        ok = 0;
+
+    if (ok && EVP_DigestFinal_ex(ctx, md, &mdlen) == 1) {
+        for (unsigned int i = 0; i < mdlen; i++)
+            sprintf(out_hex + i * 2, "%02x", md[i]);
+        out_hex[mdlen * 2] = 0;
+    } else {
+        ok = 0;
+    }
+
+    EVP_MD_CTX_free(ctx);
+    OPENSSL_cleanse(md, sizeof(md));
+    return ok;
+}
+
+static int sha256_path(const char *path, char out_hex[65])
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    int r = sha256_fd(fd, out_hex);
+    close(fd);
+    return r;
+}
+
+/* dirname("/usr/lib64/firefox/firefox") -> "/usr/lib64/firefox" */
+static void dir_of(const char *path, char *out, size_t len)
+{
+    snprintf(out, len, "%s", path);
+    char *slash = strrchr(out, '/');
+    if (slash == out)
+        out[1] = 0;
+    else if (slash)
+        *slash = 0;
+}
+
+/*
+ * Checks whether a path is a mount point, by consulting /proc/self/mounts.
+ *
+ * The old implementation compared st_dev with the parent directory, which
+ * breaks on btrfs subvolumes (e.g. Fedora's /home): a subvolume IS a
+ * separate mount, but all subvolumes share the same superblock and thus
+ * the same st_dev as /. Reading the mount table handles tmpfs /tmp,
+ * btrfs subvolume /home, and ordinary partitions alike.
+ */
+static int is_mount_point(const char *path)
+{
+    FILE *f = setmntent("/proc/self/mounts", "r");
+    if (!f)
+        return 0;
+
+    struct mntent *me;
+    int found = 0;
+    while ((me = getmntent(f))) {
+        if (strcmp(me->mnt_dir, path) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    endmntent(f);
+    return found;
+}
+
+/* ============================================================================
  * CONFIGURATION LOADING
  * ============================================================================ */
 
-static int load_config(void) {
+static int load_config(void)
+{
     FILE *f = fopen(CONF_PATH, "r");
-    if (!f) { perror("[load_config] fopen"); return -1; }
+    if (!f) {
+        perror("[load_config] fopen");
+        return -1;
+    }
 
     char line[1024];
-    g_app_count = 0;
-    g_ui_uid = 1000;
-    g_backend = BACKEND_PROC;
+    g_app_count      = 0;
+    g_watchdir_count = 0;
+    g_ui_uid         = 1000;
+    g_backend        = BACKEND_PROC;
+    g_mark_filesystem = 0;
 
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n")] = 0;
-        if (line[0] == '#' || line[0] == 0) continue;
+        if (line[0] == '#' || line[0] == 0)
+            continue;
 
         char *eq = strchr(line, '=');
-        if (!eq) continue;
+        if (!eq)
+            continue;
         *eq = 0;
 
-        char *k = line, *v = eq + 1;
+        char *k = line;
+        char *v = eq + 1;
         while (*k == ' ') k++;
         while (*v == ' ') v++;
 
         char *kend = k + strlen(k);
-        while (kend > k && (kend[-1] == ' ' || kend[-1] == '\t')) *--kend = 0;
+        while (kend > k && (kend[-1] == ' ' || kend[-1] == '\t'))
+            *--kend = 0;
 
         char *vend = v + strlen(v);
-        while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) *--vend = 0;
+        while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t'))
+            *--vend = 0;
 
         if (strcmp(k, "backend") == 0) {
             if (strcmp(v, "fanotify") == 0) {
@@ -153,24 +284,101 @@ static int load_config(void) {
             } else {
                 g_ui_uid = (uid_t)val;
             }
+        } else if (strcmp(k, "mark_filesystem") == 0) {
+            g_mark_filesystem =
+                (strcmp(v, "true") == 0 || strcmp(v, "yes") == 0 ||
+                 strcmp(v, "1") == 0);
         } else if (strcmp(k, "app") == 0 && g_app_count < MAX_APPS) {
             char *pipe = strchr(v, '|');
             if (pipe) {
                 *pipe = 0;
+                char *rest  = pipe + 1;
+                char *pipe2 = strchr(rest, '|');
+
                 snprintf(g_apps[g_app_count].path, MAX_PATH, "%s", v);
-                snprintf(g_apps[g_app_count].name, 128, "%s", pipe + 1);
+
+                if (pipe2) {                    /* path|name|hash */
+                    *pipe2 = 0;
+                    snprintf(g_apps[g_app_count].name, 128, "%s", rest);
+                    snprintf(g_apps[g_app_count].hash, 65, "%s", pipe2 + 1);
+                } else {                        /* path|name — legacy format */
+                    snprintf(g_apps[g_app_count].name, 128, "%s", rest);
+                    g_apps[g_app_count].hash[0] = 0;
+                }
+
+                /* normalize: config is hand-editable, hash case varies */
+                for (char *h = g_apps[g_app_count].hash; *h; h++)
+                    *h = (char)tolower((unsigned char)*h);
+
+                /* reference size for the cheap size prefilter */
+                struct stat st;
+                g_apps[g_app_count].size =
+                    (stat(g_apps[g_app_count].path, &st) == 0) ? st.st_size : -1;
+
                 g_app_count++;
             }
+        } else if (strcmp(k, "watchdir") == 0 && g_watchdir_count < MAX_DIRS) {
+            snprintf(g_watchdirs[g_watchdir_count], MAX_PATH, "%s", v);
+            g_watchdir_count++;
         }
     }
     fclose(f);
     return g_app_count;
 }
 
-static int is_protected(const char *exe) {
-    for (int i = 0; i < g_app_count; i++)
-        if (strcmp(g_apps[i].path, exe) == 0) return i;
+/*
+ * Identify a protected application.
+ * Hash has priority (catches copies of the binary anywhere); path is the
+ * fallback for legacy entries without a hash. The hash is normalized to
+ * lowercase at parse time, so plain strcmp suffices.
+ */
+static int identify_app(const char *path, const char *hash_hex)
+{
+    for (int i = 0; i < g_app_count; i++) {
+        if (hash_hex && g_apps[i].hash[0] &&
+            strcmp(g_apps[i].hash, hash_hex) == 0)
+            return i;
+        if (path && strcmp(g_apps[i].path, path) == 0)
+            return i;
+    }
     return -1;
+}
+
+/*
+ * Cheap prefilter: does the candidate's size even match any hash-protected
+ * binary? If not, skip the expensive SHA-256 entirely.
+ *
+ * size <= 0 (unknown reference) => pessimistically compute the hash anyway.
+ */
+static int size_candidate_match(off_t sz)
+{
+    if (sz <= 0)
+        return 1;
+    for (int i = 0; i < g_app_count; i++) {
+        if (!g_apps[i].hash[0])
+            continue;
+        if (g_apps[i].size <= 0)
+            return 1;                       /* no reference size */
+        if (g_apps[i].size == sz)
+            return 1;
+    }
+    return 0;
+}
+
+static int is_in_watchdir(const char *path)
+{
+    for (int j = 0; j < g_watchdir_count; j++) {
+        /* "/" as a watchdir covers every absolute path */
+        if (strlen(g_watchdirs[j]) == 1 && g_watchdirs[j][0] == '/')
+            return 1;
+
+        size_t len = strlen(g_watchdirs[j]);
+        if (strncmp(path, g_watchdirs[j], len) == 0 &&
+            (path[len] == '/' || path[len] == '\0')) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ============================================================================
@@ -178,7 +386,8 @@ static int is_protected(const char *exe) {
  * ============================================================================ */
 
 static void pbkdf2_hex(const char *password, const unsigned char *salt,
-                       size_t salt_len, char out_hex[PBKDF2_KEY_LEN * 2 + 1]) {
+                       size_t salt_len, char out_hex[PBKDF2_KEY_LEN * 2 + 1])
+{
     unsigned char derived[PBKDF2_KEY_LEN];
 
     PKCS5_PBKDF2_HMAC(password, strlen(password),
@@ -193,27 +402,35 @@ static void pbkdf2_hex(const char *password, const unsigned char *salt,
     memset(derived, 0, sizeof(derived));
 }
 
-static int verify_password(const char *input) {
+static int verify_password(const char *input)
+{
     FILE *f = fopen(SECRET_PATH, "r");
-    if (!f) return 0;
+    if (!f)
+        return 0;
 
     char line[256] = {0};
-    if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; }
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return 0;
+    }
     fclose(f);
     line[strcspn(line, "\n")] = 0;
 
     char *colon = strchr(line, ':');
-    if (!colon) return 0;
+    if (!colon)
+        return 0;
     *colon = 0;
 
-    const char *salt_hex = line;
+    const char *salt_hex        = line;
     const char *stored_hash_hex = colon + 1;
 
     unsigned char salt[PBKDF2_SALT_LEN];
-    if (strlen(salt_hex) != PBKDF2_SALT_LEN * 2) return 0;
+    if (strlen(salt_hex) != PBKDF2_SALT_LEN * 2)
+        return 0;
     for (int i = 0; i < PBKDF2_SALT_LEN; i++) {
         unsigned int byte;
-        if (sscanf(salt_hex + i * 2, "%2x", &byte) != 1) return 0;
+        if (sscanf(salt_hex + i * 2, "%2x", &byte) != 1)
+            return 0;
         salt[i] = (unsigned char)byte;
     }
 
@@ -228,7 +445,8 @@ static int verify_password(const char *input) {
     return result;
 }
 
-static int read_password(char *buf, size_t len) {
+static int read_password(char *buf, size_t len)
+{
     struct termios old, new;
     tcgetattr(STDIN_FILENO, &old);
     new = old;
@@ -236,7 +454,8 @@ static int read_password(char *buf, size_t len) {
     tcsetattr(STDIN_FILENO, TCSANOW, &new);
     char *r = fgets(buf, len, stdin);
     tcsetattr(STDIN_FILENO, TCSANOW, &old);
-    if (r) buf[strcspn(buf, "\n")] = 0;
+    if (r)
+        buf[strcspn(buf, "\n")] = 0;
     return r != NULL;
 }
 
@@ -244,12 +463,14 @@ static int read_password(char *buf, size_t len) {
  * DAEMON <-> UI AGENT COMMUNICATION
  * ============================================================================ */
 
-static int ask_via_ui_agent(const char *name, char *out, size_t len) {
+static int ask_via_ui_agent(const char *name, char *out, size_t len)
+{
     char ui_sock[256];
     get_ui_socket_path(ui_sock, sizeof(ui_sock), g_ui_uid);
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
+    if (fd < 0)
+        return 0;
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ui_sock);
@@ -262,13 +483,19 @@ static int ask_via_ui_agent(const char *name, char *out, size_t len) {
     char req[256];
     snprintf(req, sizeof(req), "AUTH %s\n", name);
     ssize_t w = write(fd, req, strlen(req));
-    if (w < 0) { close(fd); return 0; }
+    if (w < 0) {
+        close(fd);
+        return 0;
+    }
 
     struct timeval tv = { .tv_sec = AUTH_TIMEOUT, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     FILE *f = fdopen(fd, "r");
-    if (!f) { close(fd); return 0; }
+    if (!f) {
+        close(fd);
+        return 0;
+    }
     char *r = fgets(out, len, f);
     fclose(f);
 
@@ -287,15 +514,15 @@ static int ask_via_ui_agent(const char *name, char *out, size_t len) {
  * Prompts the user for a password and verifies it.
  * Returns 1 if the password is correct, 0 otherwise.
  *
- * This function is used by BOTH backends (proc connector and fanotify),
- * keeping the authentication logic in one place.
+ * Used by BOTH backends (proc connector and fanotify), keeping the
+ * authentication logic in one place.
  */
-static int authorize_application(const char *path, const char *name) {
+static int authorize_application(const char *path, const char *name)
+{
     char pass[256] = {0};
     int ok = ask_via_ui_agent(name, pass, sizeof(pass)) &&
              verify_password(pass);
 
-    /* Clear the password from memory regardless of the result */
     explicit_bzero(pass, sizeof(pass));
 
     if (ok)
@@ -310,16 +537,19 @@ static int authorize_application(const char *path, const char *name) {
  * MARKER FILES
  * ============================================================================ */
 
-static void marker_path(pid_t pid, const char *type, char *out, size_t len) {
+static void marker_path(pid_t pid, const char *type, char *out, size_t len)
+{
     snprintf(out, len, "%s/.applock_%s_%d", MARKER_DIR, type, pid);
 }
 
-static int already_handled(pid_t pid) {
+static int already_handled(pid_t pid)
+{
     char marker[256];
     marker_path(pid, "ok", marker, sizeof(marker));
 
     struct stat st;
-    if (stat(marker, &st) != 0) return 0;
+    if (stat(marker, &st) != 0)
+        return 0;
 
     if (time(NULL) - st.st_mtime > MARKER_TTL) {
         unlink(marker);
@@ -328,43 +558,53 @@ static int already_handled(pid_t pid) {
     return 1;
 }
 
-static void mark_handled(pid_t pid) {
+static void mark_handled(pid_t pid)
+{
     char marker[256];
     marker_path(pid, "ok", marker, sizeof(marker));
     int fd = open(marker, O_CREAT | O_WRONLY, 0600);
-    if (fd >= 0) close(fd);
+    if (fd >= 0)
+        close(fd);
 }
 
-static int is_pending(pid_t pid) {
+static int is_pending(pid_t pid)
+{
     char marker[256];
     marker_path(pid, "pending", marker, sizeof(marker));
     return access(marker, F_OK) == 0;
 }
 
-static void mark_pending(pid_t pid) {
+static void mark_pending(pid_t pid)
+{
     char marker[256];
     marker_path(pid, "pending", marker, sizeof(marker));
     int fd = open(marker, O_CREAT | O_WRONLY, 0600);
-    if (fd >= 0) close(fd);
+    if (fd >= 0)
+        close(fd);
 }
 
-static void unmark_pending(pid_t pid) {
+static void unmark_pending(pid_t pid)
+{
     char marker[256];
     marker_path(pid, "pending", marker, sizeof(marker));
     unlink(marker);
 }
 
-static void clear_all_markers(void) {
+static void clear_all_markers(void)
+{
     DIR *d = opendir(MARKER_DIR);
-    if (!d) return;
+    if (!d)
+        return;
 
     struct dirent *de;
     int count = 0;
     while ((de = readdir(d))) {
-        if (strncmp(de->d_name, ".applock_", 9) != 0) continue;
+        if (strncmp(de->d_name, ".applock_", 9) != 0)
+            continue;
         char full[256];
         snprintf(full, sizeof(full), "%s/%s", MARKER_DIR, de->d_name);
-        if (unlink(full) == 0) count++;
+        if (unlink(full) == 0)
+            count++;
     }
     closedir(d);
     fprintf(stderr, "[applockd] removed %d stale markers\n", count);
@@ -374,55 +614,72 @@ static void clear_all_markers(void) {
  * PROCESS TREE INSPECTION (used by proc connector backend)
  * ============================================================================ */
 
-static pid_t get_ppid(pid_t pid) {
+static pid_t get_ppid(pid_t pid)
+{
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     FILE *f = fopen(path, "r");
-    if (!f) return -1;
+    if (!f)
+        return -1;
 
     char buf[1024];
-    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1; }
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return -1;
+    }
     fclose(f);
 
     char *p = strrchr(buf, ')');
-    if (!p) return -1;
+    if (!p)
+        return -1;
     p += 2;
 
-    char state;
+    char  state;
     pid_t ppid;
-    if (sscanf(p, "%c %d", &state, &ppid) == 2) return ppid;
+    if (sscanf(p, "%c %d", &state, &ppid) == 2)
+        return ppid;
     return -1;
 }
 
-static int is_ancestor_authorized(pid_t pid) {
+static int is_ancestor_authorized(pid_t pid)
+{
     pid_t current = pid;
-    int depth = 0;
+    int   depth   = 0;
 
     while (current > 1 && depth < 20) {
-        if (already_handled(current)) return 1;
+        if (already_handled(current))
+            return 1;
         current = get_ppid(current);
-        if (current <= 0) break;
+        if (current <= 0)
+            break;
         depth++;
     }
     return 0;
 }
 
-static int is_process_stopped(pid_t pid) {
+static int is_process_stopped(pid_t pid)
+{
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    if (!f)
+        return 0;
 
     char buf[1024];
-    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return 0;
+    }
     fclose(f);
 
     char *p = strrchr(buf, ')');
-    if (!p) return 0;
+    if (!p)
+        return 0;
     p += 2;
 
     char state;
-    if (sscanf(p, "%c", &state) == 1) return (state == 'T');
+    if (sscanf(p, "%c", &state) == 1)
+        return (state == 'T');
     return 0;
 }
 
@@ -430,7 +687,8 @@ static int is_process_stopped(pid_t pid) {
  * BACKEND: PROC CONNECTOR
  * ============================================================================ */
 
-static int cn_proc_open(void) {
+static int cn_proc_open(void)
+{
     int fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
     if (fd < 0) {
         perror("[cn_proc] socket");
@@ -438,14 +696,13 @@ static int cn_proc_open(void) {
     }
 
     int rcvbuf = NETLINK_RCVBUF;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0)
         perror("[cn_proc] setsockopt SO_RCVBUF");
-    }
 
     struct sockaddr_nl addr = {
         .nl_family = AF_NETLINK,
         .nl_groups = CN_IDX_PROC,
-        .nl_pid = getpid()
+        .nl_pid    = getpid()
     };
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -458,18 +715,18 @@ static int cn_proc_open(void) {
     memset(buf, 0, sizeof(buf));
 
     struct nlmsghdr *nh = (struct nlmsghdr *)buf;
-    nh->nlmsg_len = NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op));
-    nh->nlmsg_type = NLMSG_DONE;
+    nh->nlmsg_len   = NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op));
+    nh->nlmsg_type  = NLMSG_DONE;
     nh->nlmsg_flags = 0;
-    nh->nlmsg_seq = 0;
-    nh->nlmsg_pid = getpid();
+    nh->nlmsg_seq   = 0;
+    nh->nlmsg_pid   = getpid();
 
     struct cn_msg *cm = (struct cn_msg *)NLMSG_DATA(nh);
     cm->id.idx = CN_IDX_PROC;
     cm->id.val = CN_VAL_PROC;
-    cm->seq = 0;
-    cm->ack = 0;
-    cm->len = sizeof(enum proc_cn_mcast_op);
+    cm->seq    = 0;
+    cm->ack    = 0;
+    cm->len    = sizeof(enum proc_cn_mcast_op);
 
     enum proc_cn_mcast_op *op = (enum proc_cn_mcast_op *)cm->data;
     *op = PROC_CN_MCAST_LISTEN;
@@ -484,18 +741,30 @@ static int cn_proc_open(void) {
     return fd;
 }
 
-static void cn_proc_handle_exec(pid_t pid) {
+static void cn_proc_handle_exec(pid_t pid)
+{
     char exe[MAX_PATH];
     char link[64];
     snprintf(link, sizeof(link), "/proc/%d/exe", pid);
     ssize_t n = readlink(link, exe, sizeof(exe) - 1);
-    if (n <= 0) return;
+    if (n <= 0)
+        return;
     exe[n] = 0;
 
-    int idx = is_protected(exe);
-    if (idx < 0) return;
+    /*
+     * BEST-EFFORT: the process is already running when we hash it, so this
+     * does not remove the proc backend's inherent TOCTOU (the kill window
+     * on denial). But it gives this backend coverage of copied binaries,
+     * which pure path-matching never had.
+     */
+    char hash_hex[65] = {0};
+    int  have_hash    = sha256_path(exe, hash_hex);
+    int  idx          = identify_app(exe, have_hash ? hash_hex : NULL);
+    if (idx < 0)
+        return;
 
-    if (is_pending(pid)) return;
+    if (is_pending(pid))
+        return;
 
     if (is_ancestor_authorized(pid)) {
         mark_handled(pid);
@@ -529,14 +798,18 @@ static void cn_proc_handle_exec(pid_t pid) {
         mark_handled(pid);
         kill(pid, SIGCONT);
     } else {
-        kill(pid, SIGCONT);
-        usleep(100000);
+        /*
+         * Denial: kill immediately, WITHOUT a SIGCONT/usleep grace period.
+         * The old CONT + usleep(100ms) + KILL sequence was a window in which
+         * the process could fork() children that survive the kill.
+         */
         kill(pid, SIGKILL);
         fprintf(stderr, "[applockd] killed %s (pid %d)\n", exe, pid);
     }
 }
 
-static void proc_backend_run(void) {
+static void proc_backend_run(void)
+{
     int fd = cn_proc_open();
     if (fd < 0) {
         fprintf(stderr, "[applockd] failed to initialize proc connector\n");
@@ -549,7 +822,8 @@ static void proc_backend_run(void) {
     while (1) {
         ssize_t len = recv(fd, buf, sizeof(buf), 0);
         if (len < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             if (errno == ENOBUFS) {
                 enobufs_count++;
                 if (enobufs_count <= 5 || enobufs_count % 100 == 0) {
@@ -562,16 +836,19 @@ static void proc_backend_run(void) {
             perror("[cn_proc] recv");
             break;
         }
-        if (len == 0) continue;
+        if (len == 0)
+            continue;
 
         struct nlmsghdr *nh;
         for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, len);
              nh = NLMSG_NEXT(nh, len)) {
 
-            if (nh->nlmsg_type != NLMSG_DONE) continue;
+            if (nh->nlmsg_type != NLMSG_DONE)
+                continue;
 
             struct cn_msg *cm = (struct cn_msg *)NLMSG_DATA(nh);
-            if (cm->id.idx != CN_IDX_PROC || cm->id.val != CN_VAL_PROC) continue;
+            if (cm->id.idx != CN_IDX_PROC || cm->id.val != CN_VAL_PROC)
+                continue;
 
             struct proc_event *ev = (struct proc_event *)cm->data;
 
@@ -585,21 +862,111 @@ static void proc_backend_run(void) {
     close(fd);
 }
 
+/* Child: while the parent waits for the UI answer, service the fanotify
+ * queue so that the UI agent's own execve (zenity) is never blocked.
+ * Protected binaries arriving during a prompt are DENIED (busy). */
+static void drain_loop_child(int fanfd)
+{
+    char buf[4096];
+    for (;;) {
+        ssize_t len = read(fanfd, buf, sizeof(buf));
+        if (len <= 0) {
+            if (len < 0 && errno == EINTR)
+                continue;
+            _exit(0);
+        }
+
+        struct fanotify_event_metadata *meta = (void *)buf;
+        while (FAN_EVENT_OK(meta, len)) {
+            if (!(meta->mask & FAN_Q_OVERFLOW) && meta->fd >= 0) {
+                char exe[MAX_PATH], procfd[64];
+                snprintf(procfd, sizeof(procfd), "/proc/self/fd/%d", meta->fd);
+                ssize_t n = readlink(procfd, exe, sizeof(exe) - 1);
+                int idx = -1;
+                if (n > 0) {
+                    exe[n] = 0;
+                    idx = identify_app(exe, NULL);
+                }
+
+                struct fanotify_response resp;
+                resp.fd = meta->fd;
+                resp.response = (idx < 0) ? FAN_ALLOW : FAN_DENY;
+
+                if (idx >= 0) {
+                    fprintf(stderr,
+                            "[fan] busy: protected '%s' denied during prompt\n",
+                            exe);
+                }
+                if (write(fanfd, &resp, sizeof(resp)) < 0)
+                    perror("[fan] drain write");
+                close(meta->fd);
+            }
+            meta = FAN_EVENT_NEXT(meta, len);
+        }
+    }
+}
+
+static int authorize_with_drain(int fanfd, const char *path, const char *name)
+{
+    fflush(stderr);
+    fflush(stdout);     /* przed fork() — bez zdublowanych buforów */
+
+    pid_t drainer = fork();
+    if (drainer == 0) {
+        drain_loop_child(fanfd);
+        _exit(0);
+    }
+    if (drainer < 0) {
+        perror("fork drainer");     /* fallback: bez drajnera */
+    }
+
+    int ok = authorize_application(path, name);
+
+    if (drainer > 0) {
+        kill(drainer, SIGKILL);
+        waitpid(drainer, NULL, 0);
+    }
+    return ok;
+}
+
+/* ============================================================================
+ * BACKEND: FANOTIFY
+ * ============================================================================ */
+
 /*
  * Fanotify backend.
  *
- * Key design decisions:
- *   - Uses FAN_CLASS_CONTENT + O_RDONLY (NOT O_RDWR, which causes ETXTBSY).
- *   - Marks ONLY the protected binaries (NOT the whole filesystem), which
- *     eliminates the risk of deadlock when Zenity loads shared libraries.
- *   - Uses authorize_application() for authentication.
- *   - Uses authorization inheritance: if an ancestor of the process has
- *     already been authorized (has a valid "ok" marker), the process is
- *     allowed without prompting.
- *   - Sends FAN_ALLOW / FAN_DENY to the kernel; the process is not started
- *     until the daemon responds.
+ * Marking strategy (per fanotify_mark(2) semantics):
+ *   - Dir marks with FAN_EVENT_ON_CHILD are SHALLOW: they fire only for
+ *     immediate children, never for files inside subdirectories ("To
+ *     monitor complete directory trees it is necessary to mark the
+ *     relevant mount").
+ *   - Therefore wide coverage comes from either
+ *       * FAN_MARK_MOUNT on watchdirs that ARE mount points (e.g. tmpfs
+ *         /tmp on modern distros) — recursive across the whole mount, or
+ *       * mark_filesystem = true  ->  FAN_MARK_FILESYSTEM on "/", covering
+ *         every execve on the filesystem regardless of mount layout, at
+ *         the cost of routing all execve traffic through this daemon.
+ *   - Plain-directory watchdirs get a shallow mark (cheap, direct children
+ *     only) plus a startup WARNING that nested files are NOT covered.
+ *   - FAN_OPEN_EXEC_PERM combined with mount/filesystem marks: man-pages
+ *     list only file-handle events (FAN_CREATE/FAN_ATTRIB/FAN_MOVE/
+ *     FAN_DELETE_SELF) as EINVAL for mount marks; EXEC_PERM is expected
+ *     to work but VERIFY EMPIRICALLY — failures are logged at startup.
+ *   - Identification is content-based: fstat size prefilter, then SHA-256
+ *     from meta->fd (no TOCTOU). Path matching stays as a cheap first
+ *     step and as fallback for legacy hashless entries.
+ *   - Unidentified executables are ALLOWED (the tool protects specific,
+ *     defined applications; prompting for "anything unrecognized" would
+ *     turn the password into a universal execution permit).
+ *   - FAN_Q_OVERFLOW is logged; the kernel fail-closes pending permission
+ *     events on queue overflow, so expect transient denials under load.
+ *   - Nothing is execve'd inside the event loop (zenity lives in the
+ *     separate unprivileged UI-agent process), so the classic
+ *     content-class deadlock cannot occur here.
  */
-static void fan_backend_run(void) {
+static void fan_backend_run(void)
+{
     int fanfd = fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT, O_RDONLY);
     if (fanfd < 0) {
         perror("[fan] fanotify_init");
@@ -607,8 +974,55 @@ static void fan_backend_run(void) {
         exit(1);
     }
 
-    /* Mark ONLY the protected binaries — NOT the whole filesystem. */
+    /*
+     * Optional full-filesystem mark: covers every execve on the filesystem,
+     * including copies anywhere in the tree, independent of mount layout.
+     * Costs one round-trip through this daemon per execve — enable
+     * consciously (mark_filesystem = true) and watch for FAN_Q_OVERFLOW.
+     */
+    if (g_mark_filesystem) {
+        if (fanotify_mark(fanfd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                          FAN_OPEN_EXEC_PERM, AT_FDCWD, "/") < 0) {
+            fprintf(stderr, "[fan] fanotify_mark(filesystem /): %s\n",
+                    strerror(errno));
+            fprintf(stderr,
+                    "[fan] falling back to per-app and watchdir marks\n");
+        } else {
+            fprintf(stderr,
+                    "[fan] FILESYSTEM mark active on / — full execve coverage\n");
+        }
+    }
+
+    /*
+     * Ignore-mask for the UI agent's zenity: with a filesystem mark, the
+     * zenity execve performed by the unprivileged UI agent would itself
+     * be mediated by this daemon — which at that moment is blocked
+     * waiting for zenity's answer. Deadlock. Library loads are open+mmap
+     * (not execve), so this single ignore closes the dependency cycle.
+     * FAN_MARK_IGNORED_SURV_MODIFY keeps the mask across file changes.
+     */
+    if (fanotify_mark(fanfd,
+                      FAN_MARK_ADD | FAN_MARK_IGNORE,
+                      FAN_OPEN_EXEC_PERM, AT_FDCWD, "/usr/bin/zenity") < 0) {
+        fprintf(stderr, "[fan] ignore-mark(zenity): %s\n", strerror(errno));
+    } else {
+        fprintf(stderr,
+                "[fan] ignore-mark: /usr/bin/zenity (deadlock prevention)\n");
+    }
+
     for (int i = 0; i < g_app_count; i++) {
+        char dir[MAX_PATH];
+        dir_of(g_apps[i].path, dir, sizeof(dir));
+
+        /* shallow: fires for direct children of the directory only */
+        if (fanotify_mark(fanfd, FAN_MARK_ADD,
+                          FAN_OPEN_EXEC_PERM | FAN_EVENT_ON_CHILD,
+                          AT_FDCWD, dir) < 0) {
+            fprintf(stderr, "[fan] fanotify_mark(dir %s): %s\n",
+                    dir, strerror(errno));
+        }
+
+        /* the binary itself (also covers exec via hardlinks of same inode) */
         if (fanotify_mark(fanfd, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM,
                           AT_FDCWD, g_apps[i].path) < 0) {
             fprintf(stderr, "[fan] fanotify_mark(%s): %s\n",
@@ -619,20 +1033,63 @@ static void fan_backend_run(void) {
         }
     }
 
-    fprintf(stderr, "[applockd] fanotify backend active, %d markers\n",
-            g_app_count);
+    for (int j = 0; j < g_watchdir_count; j++) {
+        if (is_mount_point(g_watchdirs[j])) {
+            /* recursive across the whole mount (e.g. tmpfs /tmp) */
+            if (fanotify_mark(fanfd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+                              FAN_OPEN_EXEC_PERM,
+                              AT_FDCWD, g_watchdirs[j]) < 0) {
+                fprintf(stderr, "[fan] fanotify_mark(mount %s): %s\n",
+                        g_watchdirs[j], strerror(errno));
+            } else {
+                fprintf(stderr, "[fan] watchdir (mount, recursive): %s\n",
+                        g_watchdirs[j]);
+            }
+        } else {
+            /* SHALLOW mark: immediate children only — nested files are
+             *              NOT covered (fanotify_mark(2)); warn honestly. */
+            if (fanotify_mark(fanfd, FAN_MARK_ADD,
+                              FAN_OPEN_EXEC_PERM | FAN_EVENT_ON_CHILD,
+                              AT_FDCWD, g_watchdirs[j]) < 0) {
+                fprintf(stderr, "[fan] fanotify_mark(dir %s): %s\n",
+                        g_watchdirs[j], strerror(errno));
+            } else {
+                fprintf(stderr,
+                        "[fan] WARNING: watchdir (plain dir, SHALLOW): %s — "
+                        "nested subdirectories are NOT observed; use a "
+                        "tmpfs/mount or mark_filesystem = true\n",
+                        g_watchdirs[j]);
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "[applockd] fanotify backend active "
+            "(apps=%d, watchdirs=%d, fs_mark=%s)\n",
+            g_app_count, g_watchdir_count,
+            g_mark_filesystem ? "yes" : "no");
 
     char buf[4096];
     while (1) {
         ssize_t len = read(fanfd, buf, sizeof(buf));
         if (len < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             perror("[fan] read");
             break;
         }
 
         struct fanotify_event_metadata *meta = (void *)buf;
         while (FAN_EVENT_OK(meta, len)) {
+
+            if (meta->mask & FAN_Q_OVERFLOW) {
+                fprintf(stderr, "[fan] FAN_Q_OVERFLOW — events were lost; "
+                        "kernel fail-closes pending permission "
+                        "events, expect transient denials\n");
+                meta = FAN_EVENT_NEXT(meta, len);
+                continue;
+            }
+
             if (meta->fd >= 0) {
                 char exe[MAX_PATH];
                 char procfd[64];
@@ -644,23 +1101,34 @@ static void fan_backend_run(void) {
 
                 if (n > 0) {
                     exe[n] = 0;
-                    int idx = is_protected(exe);
+
+                    /* 1. cheap path match (original locations, legacy entries) */
+                    int idx = identify_app(exe, NULL);
 
                     if (idx < 0) {
-                        /* Not protected — allow without prompting */
+                        /*
+                         * 2. Content identification. With a filesystem mark
+                         *    events arrive from ANY location, so the gate
+                         *    must be open everywhere; without one, restrict
+                         *    hashing to watchdir members to keep the cost
+                         *    proportional to config.
+                         */
+                        if (g_mark_filesystem || is_in_watchdir(exe)) {
+                            struct stat st;
+                            if (fstat(meta->fd, &st) == 0 &&
+                                size_candidate_match(st.st_size)) {
+                                char hash_hex[65] = {0};
+                                if (sha256_fd(meta->fd, hash_hex))
+                                    idx = identify_app(NULL, hash_hex);
+                            }
+                        }
+                    }
+
+                    if (idx < 0) {
                         resp.response = FAN_ALLOW;
                     } else {
                         pid_t pid = meta->pid;
 
-                        /*
-                         * Authorization inheritance: if the process or any
-                         * of its ancestors has already been authorized
-                         * (has a valid "ok" marker), allow without prompting.
-                         *
-                         * This handles the case where Firefox spawns a child
-                         * process (e.g. content process) after the main
-                         * process has been authenticated.
-                         */
                         if (is_ancestor_authorized(pid)) {
                             fprintf(stderr,
                                     "[applockd] %s (pid %d) — ancestor already authorized, allowing\n",
@@ -672,7 +1140,7 @@ static void fan_backend_run(void) {
                                     "[applockd] detected %s (pid %d)\n",
                                     g_apps[idx].name, pid);
 
-                            int ok = authorize_application(exe, g_apps[idx].name);
+                            int ok = authorize_with_drain(fanfd, exe, g_apps[idx].name);
                             if (ok) {
                                 mark_handled(pid);
                                 resp.response = FAN_ALLOW;
@@ -682,7 +1150,7 @@ static void fan_backend_run(void) {
                         }
                     }
                 } else {
-                    /* Cannot resolve path — deny by default */
+                    /* cannot resolve path — fail-closed */
                     resp.response = FAN_DENY;
                 }
 
@@ -696,65 +1164,20 @@ static void fan_backend_run(void) {
     }
 
     close(fanfd);
-} 
-
-/* ============================================================================
- * AUTHENTICATION SERVER
- * ============================================================================ */
-
-static void auth_server(void) {
-    unlink(SOCK_PATH);
-
-    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (srv < 0) { perror("socket"); exit(1); }
-
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SOCK_PATH);
-    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); exit(1);
-    }
-
-    chmod(SOCK_PATH, 0600);
-    listen(srv, 8);
-    fprintf(stderr, "[applockd] listening on %s\n", SOCK_PATH);
-
-    while (1) {
-        int c = accept(srv, NULL, NULL);
-        if (c < 0) continue;
-
-        char buf[512] = {0};
-        ssize_t r = read(c, buf, sizeof(buf) - 1);
-        if (r <= 0) { close(c); continue; }
-
-        int pid; char name[128];
-        if (sscanf(buf, "AUTH %d %127s", &pid, name) == 2) {
-            char pass[256] = {0};
-            fprintf(stderr,
-                    "\n[applockd] application '%s' (pid %d) waiting for password:\n",
-                    name, pid);
-
-            if (ask_via_ui_agent(name, pass, sizeof(pass)) &&
-                verify_password(pass)) {
-                if (write(c, "OK\n", 3) < 0) perror("write OK");
-                fprintf(stderr, "[applockd] authorization OK\n");
-            } else {
-                if (write(c, "FAIL\n", 5) < 0) perror("write FAIL");
-                fprintf(stderr, "[applockd] authorization DENIED\n");
-            }
-            memset(pass, 0, sizeof(pass));
-        }
-        close(c);
-    }
 }
 
 /* ============================================================================
  * UI AGENT: ZENITY PASSWORD PROMPT
  * ============================================================================ */
 
-static int run_zenity_password(const char *title, char *out, size_t len) {
+static int run_zenity_password(const char *title, char *out, size_t len)
+{
     char tmpfile[] = "/tmp/applock-pass-XXXXXX";
     int fd = mkstemp(tmpfile);
-    if (fd < 0) { perror("mkstemp"); return 0; }
+    if (fd < 0) {
+        perror("mkstemp");
+        return 0;
+    }
     close(fd);
 
     pid_t pid = fork();
@@ -766,19 +1189,29 @@ static int run_zenity_password(const char *title, char *out, size_t len) {
 
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
 
         int outfd = open(tmpfile, O_WRONLY | O_TRUNC);
-        if (outfd >= 0) { dup2(outfd, STDOUT_FILENO); close(outfd); }
+        if (outfd >= 0) {
+            dup2(outfd, STDOUT_FILENO);
+            close(outfd);
+        }
 
         int errfd = open("/dev/null", O_WRONLY);
-        if (errfd >= 0) { dup2(errfd, STDERR_FILENO); close(errfd); }
+        if (errfd >= 0) {
+            dup2(errfd, STDERR_FILENO);
+            close(errfd);
+        }
 
-        const char *disp = getenv("DISPLAY");
+        const char *disp  = getenv("DISPLAY");
         const char *xauth = getenv("XAUTHORITY");
-        const char *dbus = getenv("DBUS_SESSION_BUS_ADDRESS");
+        const char *dbus  = getenv("DBUS_SESSION_BUS_ADDRESS");
 
-        if (!disp || !*disp) setenv("DISPLAY", ":0.0", 1);
+        if (!disp || !*disp)
+            setenv("DISPLAY", ":0.0", 1);
 
         if (!xauth || !*xauth) {
             const char *home = getenv("HOME");
@@ -816,7 +1249,10 @@ static int run_zenity_password(const char *title, char *out, size_t len) {
     }
 
     FILE *f = fopen(tmpfile, "r");
-    if (!f) { unlink(tmpfile); return 0; }
+    if (!f) {
+        unlink(tmpfile);
+        return 0;
+    }
     char *r = fgets(out, len, f);
     fclose(f);
     unlink(tmpfile);
@@ -828,23 +1264,29 @@ static int run_zenity_password(const char *title, char *out, size_t len) {
     return 0;
 }
 
-static void ui_agent_loop(void) {
+static void ui_agent_loop(void)
+{
     char sockpath[256];
     get_ui_socket_path(sockpath, sizeof(sockpath), getuid());
 
     unlink(sockpath);
 
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (srv < 0) { perror("socket"); exit(1); }
+    if (srv < 0) {
+        perror("socket");
+        exit(1);
+    }
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sockpath);
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind ui"); exit(1);
+        perror("bind ui");
+        exit(1);
     }
 
     chmod(sockpath, 0600);
     listen(srv, 8);
+
     fprintf(stderr, "[applock-ui] listening on %s\n", sockpath);
     fprintf(stderr, "[applock-ui] DISPLAY=%s XAUTHORITY=%s\n",
             getenv("DISPLAY") ? getenv("DISPLAY") : "(null)",
@@ -853,11 +1295,15 @@ static void ui_agent_loop(void) {
 
     while (1) {
         int c = accept(srv, NULL, NULL);
-        if (c < 0) continue;
+        if (c < 0)
+            continue;
 
         char buf[512] = {0};
         ssize_t r = read(c, buf, sizeof(buf) - 1);
-        if (r <= 0) { close(c); continue; }
+        if (r <= 0) {
+            close(c);
+            continue;
+        }
 
         char name[128] = {0};
         if (sscanf(buf, "AUTH %127s", name) == 1) {
@@ -867,10 +1313,13 @@ static void ui_agent_loop(void) {
 
             int ok = run_zenity_password(title, pass, sizeof(pass));
             if (ok) {
-                if (write(c, pass, strlen(pass)) < 0) perror("write pass");
-                if (write(c, "\n", 1) < 0) perror("write nl");
+                if (write(c, pass, strlen(pass)) < 0)
+                    perror("write pass");
+                if (write(c, "\n", 1) < 0)
+                    perror("write nl");
             } else {
-                if (write(c, "FAIL\n", 5) < 0) perror("write FAIL");
+                if (write(c, "FAIL\n", 5) < 0)
+                    perror("write FAIL");
             }
             memset(pass, 0, sizeof(pass));
         }
@@ -882,15 +1331,18 @@ static void ui_agent_loop(void) {
  * COMMAND-LINE CLIENT
  * ============================================================================ */
 
-static int cmd_set_secret(void) {
+static int cmd_set_secret(void)
+{
     char p1[256], p2[256];
     printf("New password: ");
     fflush(stdout);
-    if (!read_password(p1, sizeof(p1))) return 1;
+    if (!read_password(p1, sizeof(p1)))
+        return 1;
 
     printf("Repeat password: ");
     fflush(stdout);
-    if (!read_password(p2, sizeof(p2))) return 1;
+    if (!read_password(p2, sizeof(p2)))
+        return 1;
 
     if (strcmp(p1, p2) != 0) {
         fprintf(stderr, "Passwords do not match.\n");
@@ -915,7 +1367,10 @@ static int cmd_set_secret(void) {
 
     mkdir("/etc/applock", 0700);
     FILE *f = fopen(SECRET_PATH, "w");
-    if (!f) { perror("secret"); return 1; }
+    if (!f) {
+        perror("secret");
+        return 1;
+    }
 
     for (int i = 0; i < PBKDF2_SALT_LEN; i++)
         fprintf(f, "%02x", salt[i]);
@@ -931,47 +1386,67 @@ static int cmd_set_secret(void) {
     return 0;
 }
 
-static int cmd_add_app(int argc, char **argv) {
+static int cmd_add_app(int argc, char **argv)
+{
     if (argc < 4) {
         fprintf(stderr, "Usage: applock add <path> <name>\n");
         return 1;
     }
 
-    if (access(argv[2], X_OK) != 0) { perror(argv[2]); return 1; }
+    if (access(argv[2], X_OK) != 0) {
+        perror(argv[2]);
+        return 1;
+    }
+
+    char hash_hex[65] = {0};
+    if (!sha256_path(argv[2], hash_hex)) {
+        fprintf(stderr, "Failed to compute SHA-256 for %s\n", argv[2]);
+        return 1;
+    }
 
     mkdir("/etc/applock", 0700);
     FILE *f = fopen(CONF_PATH, "a");
-    if (!f) { perror(CONF_PATH); return 1; }
+    if (!f) {
+        perror(CONF_PATH);
+        return 1;
+    }
 
-    fprintf(f, "app = %s|%s\n", argv[2], argv[3]);
+    fprintf(f, "app = %s|%s|%s\n", argv[2], argv[3], hash_hex);
     fclose(f);
 
     printf("Added: %s (%s)\n", argv[3], argv[2]);
+    printf("  sha256: %s\n", hash_hex);
     return 0;
 }
 
-static int cmd_list(void) {
+static int cmd_list(void)
+{
     if (load_config() <= 0) {
         printf("No protected applications.\n");
         return 0;
     }
+
     printf("backend = %s\n",
            g_backend == BACKEND_FANOTIFY ? "fanotify" : "proc");
     printf("ui_uid = %u\n", (unsigned)g_ui_uid);
-    for (int i = 0; i < g_app_count; i++)
-        printf("%s -> %s\n", g_apps[i].name, g_apps[i].path);
+    printf("mark_filesystem = %s\n", g_mark_filesystem ? "yes" : "no");
+
+    for (int i = 0; i < g_app_count; i++) {
+        printf("%s -> %s [%s]\n", g_apps[i].name, g_apps[i].path,
+               g_apps[i].hash[0] ? g_apps[i].hash : "no-hash");
+    }
+
+    for (int j = 0; j < g_watchdir_count; j++)
+        printf("watchdir: %s\n", g_watchdirs[j]);
+
     return 0;
 }
 
-static int cmd_run(void) {
+static int cmd_run(void)
+{
     if (load_config() <= 0) {
         fprintf(stderr, "No protected applications in %s\n", CONF_PATH);
         return 1;
-    }
-
-    if (fork() == 0) {
-        auth_server();
-        _exit(0);
     }
 
     mkdir(MARKER_DIR, 0700);
@@ -980,25 +1455,30 @@ static int cmd_run(void) {
     fprintf(stderr, "[applockd] backend: %s\n",
             g_backend == BACKEND_FANOTIFY ? "fanotify" : "proc connector");
     fprintf(stderr, "[applockd] %d protected applications\n", g_app_count);
-    for (int i = 0; i < g_app_count; i++)
-        fprintf(stderr, "[applockd] protected path #%d: '%s' (name: %s)\n",
-                i, g_apps[i].path, g_apps[i].name);
 
-    if (g_backend == BACKEND_FANOTIFY) {
-        fan_backend_run();
-    } else {
-        proc_backend_run();
+    for (int i = 0; i < g_app_count; i++) {
+        fprintf(stderr, "[applockd] protected path #%d: '%s' (name: %s%s%s)\n",
+                i, g_apps[i].path, g_apps[i].name,
+                g_apps[i].hash[0] ? ", sha256: " : "",
+                g_apps[i].hash[0] ? g_apps[i].hash : "");
     }
+
+    if (g_backend == BACKEND_FANOTIFY)
+        fan_backend_run();
+    else
+        proc_backend_run();
 
     return 0;
 }
 
-static int cmd_ui(void) {
+static int cmd_ui(void)
+{
     ui_agent_loop();
     return 0;
 }
 
-static void usage(void) {
+static void usage(void)
+{
     printf("Usage: applock <command>\n"
            "  set-secret            set the authentication password\n"
            "  add <path> <name>     add an application to protect\n"
@@ -1007,8 +1487,12 @@ static void usage(void) {
            "  ui                    start the UI agent (Zenity, as user)\n");
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) { usage(); return 1; }
+int main(int argc, char **argv)
+{
+    if (argc < 2) {
+        usage();
+        return 1;
+    }
 
     if (strcmp(argv[1], "set-secret") == 0) return cmd_set_secret();
     if (strcmp(argv[1], "add") == 0)        return cmd_add_app(argc, argv);
