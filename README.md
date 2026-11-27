@@ -113,11 +113,9 @@ sudo applock list
 Example output:
 
 ```
-backend = fanotify
+backend = proc
 ui_uid = 1000
 mark_filesystem = yes
-app = /usr/lib/ungoogled-chromium/chromium|Chromium|a6ef98b847e2d150dde37b105b6debce6853a18b729c890aac8db439dfc2f1b7
-app = /usr/lib/vmware/bin/vmware-vmx|vmware|72eb32e314865eb588a4d58bff8eba950c29e77a542e8f5fd2357b2bfad064be
 app = /usr/lib/firefox-esr/firefox-esr|Firefox|d8a8e1a44dd5859fae86c3434d76636b59beb1defb9d45e7f43ea0fba0b59864
 
 ```
