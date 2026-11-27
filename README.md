@@ -194,7 +194,7 @@ Hidden=false
 X-GNOME-Autostart-enabled=true
 ```
 
-The agent starts automatically on the next login. You can also run it manually in an XFCE terminal:
+The agent starts automatically on the next login. You can also run it manually in terminal:
 
 ```bash
 /usr/local/bin/applock ui
