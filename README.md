@@ -125,14 +125,17 @@ Edit `/etc/applock/config`:
 
 ```
 backend = proc          # default; or: fanotify
-ui_uid = 1000
+ui_uid = 1000           # check id -u
+mark_filesystem = no    # yes — full execve coverage
 app = /usr/lib64/firefox/firefox|Firefox-Real
 app = /usr/share/librewolf/librewolf|LibreWolf
 ```
 
 - `backend = proc` – uses proc connector (no `CAP_SYS_ADMIN` required).
 - `backend = fanotify` – uses fanotify (requires `CAP_SYS_ADMIN`, process never starts without authorization).
+- `mark_filesystem = yes` – FILESYSTEM mark active on / - prevents some tricks like cp -r /usr/lib64/firefox /tmp/ffdir && /tmp/ffdir/firefox
 
+  
 ### Optional: set the UI agent UID
 
 If the UI agent runs under a UID other than 1000, add:
