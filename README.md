@@ -113,10 +113,13 @@ sudo applock list
 Example output:
 
 ```
-backend = proc
+backend = fanotify
 ui_uid = 1000
-Firefox-Real -> /usr/lib64/firefox/firefox
-LibreWolf -> /usr/share/librewolf/librewolf
+mark_filesystem = yes
+app = /usr/lib/ungoogled-chromium/chromium|Chromium|a6ef98b847e2d150dde37b105b6debce6853a18b729c890aac8db439dfc2f1b7
+app = /usr/lib/vmware/bin/vmware-vmx|vmware|72eb32e314865eb588a4d58bff8eba950c29e77a542e8f5fd2357b2bfad064be
+app = /usr/lib/firefox-esr/firefox-esr|Firefox|d8a8e1a44dd5859fae86c3434d76636b59beb1defb9d45e7f43ea0fba0b59864
+
 ```
 
 ### Select the backend
@@ -127,13 +130,12 @@ Edit `/etc/applock/config`:
 backend = proc          # default; or: fanotify
 ui_uid = 1000           # check id -u
 mark_filesystem = no    # yes — full execve coverage
-app = /usr/lib64/firefox/firefox|Firefox-Real
-app = /usr/share/librewolf/librewolf|LibreWolf
+app = /usr/lib/firefox-esr/firefox-esr|Firefox|d8a8e1a44dd5859fae86c3434d76636b59beb1d7fb9d45e7f43ea0fba0b59864
 ```
 
 - `backend = proc` – uses proc connector (no `CAP_SYS_ADMIN` required).
 - `backend = fanotify` – uses fanotify (requires `CAP_SYS_ADMIN`, process never starts without authorization).
-- `mark_filesystem = yes` – FILESYSTEM mark active on / - prevents some tricks like cp -r /usr/lib64/firefox /tmp/ffdir && /tmp/ffdir/firefox
+- `mark_filesystem = yes` – FILESYSTEM mark active on / - prevents some tricks like cp -r /usr/lib/firefox /tmp/ffdir && /tmp/ffdir/firefox
 
   
 ### Optional: set the UI agent UID
